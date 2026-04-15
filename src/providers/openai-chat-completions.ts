@@ -3,8 +3,6 @@ import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/reso
 import type { TACTool } from 'twilio-agent-connect';
 
 import { config } from '../config.js';
-import { systemPrompt } from '../prompts/systemPrompt.js';
-import { getAdditionalContext } from '../prompts/additionalContext.js';
 import { executeTool } from '../tools/index.js';
 import type { LLMProvider, ToolAction } from './types.js';
 
@@ -12,13 +10,12 @@ export class OpenAIChatCompletionsProvider implements LLMProvider {
   private openai: OpenAI;
   private messages: ChatCompletionMessageParam[];
   private lastAction: ToolAction | undefined;
+  private currentTools: TACTool[] = [];
 
   constructor() {
     console.log('[ChatCompletions] Initializing provider');
     this.openai = new OpenAI({ apiKey: config.openai.apiKey });
     this.messages = [
-      { role: 'system', content: systemPrompt },
-      { role: 'system', content: getAdditionalContext() },
       { role: 'assistant', content: config.welcomeGreeting },
     ];
   }
@@ -40,6 +37,7 @@ export class OpenAIChatCompletionsProvider implements LLMProvider {
     tools: TACTool[],
     signal?: AbortSignal
   ): Promise<string> {
+    this.currentTools = tools;
     this.messages.push({ role: 'user', content: userMessage });
     return this.complete(tools, signal);
   }
@@ -49,6 +47,7 @@ export class OpenAIChatCompletionsProvider implements LLMProvider {
     tools: TACTool[],
     signal?: AbortSignal
   ): AsyncIterable<string> {
+    this.currentTools = tools;
     this.messages.push({ role: 'user', content: userMessage });
     yield* this.streamComplete(tools, signal);
   }
@@ -175,7 +174,7 @@ export class OpenAIChatCompletionsProvider implements LLMProvider {
   // ── Tool execution + side-effect tracking ────────────────────────────────
 
   private async executeAndTrackAction(name: string, args: string): Promise<string> {
-    const result = await executeTool(name, args);
+    const result = await executeTool(name, args, this.currentTools);
 
     if (name === 'human_agent_handoff') {
       const parsed = JSON.parse(args);

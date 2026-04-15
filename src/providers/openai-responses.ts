@@ -2,8 +2,6 @@ import OpenAI from 'openai';
 import type { TACTool } from 'twilio-agent-connect';
 
 import { config } from '../config.js';
-import { systemPrompt } from '../prompts/systemPrompt.js';
-import { getAdditionalContext } from '../prompts/additionalContext.js';
 import { executeTool } from '../tools/index.js';
 import type { LLMProvider, ToolAction } from './types.js';
 
@@ -14,18 +12,20 @@ export class OpenAIResponsesProvider implements LLMProvider {
   private openai: OpenAI;
   private conversationHistory: ResponseInput;
   private lastAction: ToolAction | undefined;
+  private systemInstructions: string = '';
+  private currentTools: TACTool[] = [];
 
   constructor() {
     console.log('[Responses] Initializing provider');
     this.openai = new OpenAI({ apiKey: config.openai.apiKey });
     this.conversationHistory = [
-      { type: 'message', role: 'system', content: getAdditionalContext() },
       { type: 'message', role: 'assistant', content: config.welcomeGreeting },
     ];
   }
 
   addSystemContext(content: string): void {
-    this.conversationHistory.push({ type: 'message', role: 'system', content });
+    // Accumulate into instructions for the Responses API
+    this.systemInstructions += (this.systemInstructions ? '\n\n' : '') + content;
   }
 
   getLastAction(): ToolAction | undefined {
@@ -41,6 +41,7 @@ export class OpenAIResponsesProvider implements LLMProvider {
     tools: TACTool[],
     signal?: AbortSignal
   ): Promise<string> {
+    this.currentTools = tools;
     this.conversationHistory.push({ type: 'message', role: 'user', content: userMessage });
     return this.complete(tools, signal);
   }
@@ -50,6 +51,7 @@ export class OpenAIResponsesProvider implements LLMProvider {
     tools: TACTool[],
     signal?: AbortSignal
   ): AsyncIterable<string> {
+    this.currentTools = tools;
     this.conversationHistory.push({ type: 'message', role: 'user', content: userMessage });
     yield* this.streamComplete(tools, signal);
   }
@@ -70,7 +72,7 @@ export class OpenAIResponsesProvider implements LLMProvider {
 
       const response = await this.openai.responses.create({
         model: config.llm.model,
-        instructions: systemPrompt,
+        instructions: this.systemInstructions,
         input: this.conversationHistory,
         tools: responsesTools,
         ...(config.openai.maxCompletionTokens && {
@@ -134,7 +136,7 @@ export class OpenAIResponsesProvider implements LLMProvider {
 
       const stream = await this.openai.responses.create({
         model: config.llm.model,
-        instructions: systemPrompt,
+        instructions: this.systemInstructions,
         input: this.conversationHistory,
         tools: responsesTools,
         stream: true,
@@ -143,8 +145,7 @@ export class OpenAIResponsesProvider implements LLMProvider {
         }),
       });
 
-      let hasToolCalls = false;
-      const pendingToolCalls: Array<{ call_id: string; name: string; arguments: string }> = [];
+      let completedResponse: OpenAI.Responses.Response | undefined;
 
       for await (const event of stream) {
         if (signal?.aborted) return;
@@ -153,34 +154,32 @@ export class OpenAIResponsesProvider implements LLMProvider {
           yield event.delta;
         }
 
-        if (event.type === 'response.function_call_arguments.done') {
-          hasToolCalls = true;
-          const fcEvent = event as unknown as { call_id: string; name: string; arguments: string };
-          pendingToolCalls.push({
-            call_id: fcEvent.call_id,
-            name: fcEvent.name,
-            arguments: fcEvent.arguments,
-          });
-        }
-
         if (event.type === 'response.completed') {
+          completedResponse = event.response;
           // Add all output to history
           this.conversationHistory.push(...(event.response.output as ResponseInputItem[]));
         }
       }
 
-      if (hasToolCalls) {
-        for (const tc of pendingToolCalls) {
-          const result = await this.executeAndTrackAction(tc.name, tc.arguments);
-          this.conversationHistory.push({
-            type: 'function_call_output',
-            call_id: tc.call_id,
-            output: result,
-          });
-        }
+      // Check for tool calls in the completed response output
+      if (completedResponse) {
+        const functionCalls = completedResponse.output.filter(
+          (item): item is OpenAI.Responses.ResponseFunctionToolCall => item.type === 'function_call'
+        );
 
-        // Loop to re-invoke with tool results
-        continue;
+        if (functionCalls.length > 0) {
+          for (const fc of functionCalls) {
+            const result = await this.executeAndTrackAction(fc.name, fc.arguments);
+            this.conversationHistory.push({
+              type: 'function_call_output',
+              call_id: fc.call_id,
+              output: result,
+            });
+          }
+
+          // Loop to re-invoke with tool results
+          continue;
+        }
       }
 
       return;
@@ -188,7 +187,7 @@ export class OpenAIResponsesProvider implements LLMProvider {
   }
 
   private async executeAndTrackAction(name: string, args: string): Promise<string> {
-    const result = await executeTool(name, args);
+    const result = await executeTool(name, args, this.currentTools);
 
     if (name === 'human_agent_handoff') {
       const parsed = JSON.parse(args);

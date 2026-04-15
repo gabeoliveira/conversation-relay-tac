@@ -22,7 +22,6 @@ import type { FastifyRequest, FastifyReply } from 'fastify';
 import type { TAC, ConversationSession, TACMemoryResponse, ConversationId } from 'twilio-agent-connect';
 import type { LLMProvider } from '../providers/types.js';
 import { config } from '../config.js';
-import { allTools } from '../tools/index.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -35,10 +34,13 @@ interface ConversationWebhookPayload {
   EventType: string;
   Source?: string;
   ClientIdentity?: string;
+  InteractiveData?: string;
+  FlowData?: string;
 }
 
 interface ConversationsV1Options {
   tac: TAC;
+  tools: import('twilio-agent-connect').TACTool[];
   getProvider: (conversationId: ConversationId) => Promise<LLMProvider>;
   handlePostCompletion: (provider: LLMProvider, conversationId: ConversationId, channel: string) => Promise<void>;
   injectMemoryContext: (provider: LLMProvider, memory: TACMemoryResponse, session: ConversationSession) => void;
@@ -270,7 +272,7 @@ export function registerConversationsV1Routes(
   fastify: any,
   options: ConversationsV1Options
 ): void {
-  const { tac, getProvider, handlePostCompletion, injectMemoryContext } = options;
+  const { tac, tools, getProvider, handlePostCompletion, injectMemoryContext } = options;
 
   fastify.post(
     '/conversations-webhook',
@@ -281,8 +283,11 @@ export function registerConversationsV1Routes(
       await reply.code(200).send({ status: 'ok' });
 
       try {
-        const { ConversationSid, Body, Author, EventType, ParticipantSid } = payload;
+        const { ConversationSid, Body, Author, EventType, ParticipantSid, InteractiveData } = payload;
         console.log(`[V1] Webhook received: ${EventType} on ${ConversationSid} from ${Author}`);
+        if (InteractiveData) {
+          console.log(`[V1] InteractiveData:`, InteractiveData);
+        }
 
         // Only process actual messages
         if (EventType !== 'onMessageAdded') return;
@@ -299,7 +304,7 @@ export function registerConversationsV1Routes(
           return;
         }
 
-        if (!Body?.trim()) return;
+        if (!Body?.trim() && !InteractiveData) return;
 
         // Get participant details for phone number
         let customerPhone = '';
@@ -365,8 +370,14 @@ export function registerConversationsV1Routes(
           sendTypingIndicator(customerPhone);
         }
 
+        // Build the message for the LLM — include InteractiveData if present (WhatsApp Flow response)
+        let llmMessage = Body || '';
+        if (InteractiveData) {
+          llmMessage += `\n\nWhatsApp Flow response (InteractiveData):\n${InteractiveData}`;
+        }
+
         // Generate LLM response
-        const response = await provider.generateResponse(Body, allTools);
+        const response = await provider.generateResponse(llmMessage, tools);
 
         // Send response via Conversations v1
         await client.conversations.v1

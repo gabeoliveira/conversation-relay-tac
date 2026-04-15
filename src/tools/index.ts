@@ -200,12 +200,19 @@ export const allTools: TACTool[] = [
 ];
 
 /**
- * Execute a tool by name. Used by all LLM providers.
+ * Execute a tool by name. Searches the provided tools array, or falls back to allTools.
  */
-export async function executeTool(name: string, args: string): Promise<string> {
-  const tool = allTools.find((t) => t.name === name);
+export async function executeTool(name: string, args: string, tools?: TACTool[]): Promise<string> {
+  const searchList = tools || allTools;
+  const tool = searchList.find((t) => t.name === name);
   if (!tool) throw new Error(`Tool ${name} not implemented`);
-  const parsed = JSON.parse(args);
+  let parsed;
+  try {
+    parsed = JSON.parse(args);
+  } catch (err) {
+    console.error(`[executeTool] Malformed JSON for tool ${name}:`, args);
+    return `Error: received malformed arguments for ${name}. Please try again.`;
+  }
   const result = await tool.implementation(parsed);
   return typeof result === 'string' ? result : JSON.stringify(result);
 }

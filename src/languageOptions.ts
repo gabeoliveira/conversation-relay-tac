@@ -14,10 +14,10 @@ export const languageOptions: { [key: string]: LanguageOption } = {
     locale_code: "pt-BR",
     ttsProvider: "ElevenLabs",
     ttsLanguage: "pt-BR",
-    voice: "iScHbNW8K33gNo3lGgbo",
+    voice: "33B4UnXyTNbgLmdEDh5P",
     transcriptionProvider: "Deepgram",
     transcriptionLanguage: "pt-BR",
-    speechModel: "nova-2-general",
+    speechModel: "nova-3-general",
   },
   spanish: {
     locale_code: "es-ES",
