@@ -101,6 +101,49 @@ export function createApp(options: AppOptions): void {
     return provider;
   }
 
+  // ─── WhatsApp Typing Indicator ───────────────────────────────────────────────
+
+  function sendWhatsAppTypingIndicator(customerPhone: string): void {
+    const tacConfig = tac.getConfig();
+    void (async () => {
+      try {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        const authHeader =
+          'Basic ' +
+          Buffer.from(`${tacConfig.twilioAccountSid}:${tacConfig.twilioAuthToken}`).toString('base64');
+
+        const listUrl = new URL(
+          `https://api.twilio.com/2010-04-01/Accounts/${tacConfig.twilioAccountSid}/Messages.json`
+        );
+        listUrl.searchParams.set('From', customerPhone);
+        listUrl.searchParams.set('PageSize', '1');
+
+        const listResponse = await fetch(listUrl.toString(), {
+          headers: { Authorization: authHeader },
+        });
+        if (!listResponse.ok) return;
+
+        const listData = (await listResponse.json()) as { messages?: { sid: string }[] };
+        if (!listData.messages || listData.messages.length === 0) return;
+
+        await fetch('https://messaging.twilio.com/v2/Indicators/Typing.json', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Authorization: authHeader,
+          },
+          body: new URLSearchParams({
+            messageId: listData.messages[0]!.sid,
+            channel: 'whatsapp',
+          }).toString(),
+        });
+      } catch {
+        // Fire-and-forget
+      }
+    })();
+  }
+
   // ─── Memory Context Injection ───────────────────────────────────────────────
 
   function injectMemoryContext(
@@ -210,6 +253,11 @@ export function createApp(options: AppOptions): void {
     // Inject customer phone for messaging channels
     if (channel !== 'voice' && session.authorInfo?.address) {
       const customerPhone = session.authorInfo.address.replace(/^whatsapp:/i, '');
+
+      // Send typing indicator for WhatsApp (fire-and-forget)
+      if (channel === 'whatsapp' && session.authorInfo.address.startsWith('whatsapp:')) {
+        sendWhatsAppTypingIndicator(session.authorInfo.address);
+      }
       provider.addSystemContext(`Customer phone: ${customerPhone}`);
 
       // Register AI agent participant on first message (Maestro mode only)
