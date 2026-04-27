@@ -9,9 +9,10 @@ dotenvConfig();
 
 import { createApp } from './app.js';
 import { systemPrompt } from './prompts/systemPrompt.js';
-import { allTools } from './tools/index.js';
+import { allTools, buildKnowledgeTools } from './tools/index.js';
 
 createApp({
   systemPrompt,
   tools: allTools,
+  buildDynamicTools: buildKnowledgeTools,
 });

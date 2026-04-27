@@ -26,6 +26,7 @@ An AI-powered conversational assistant built on **Twilio Agent Connect (TAC)** t
 - **SMS Channel**: TAC built-in `SMSChannel`
 - **Dual Messaging Modes**: Maestro (active) or Conversations v1 (Flex-compatible)
 - **Customer Memory**: Automatic Memora integration — observations, summaries, profile traits
+- **Enterprise Knowledge**: Domain-scoped knowledge base search via dynamically registered tools (see [KNOWLEDGE.md](KNOWLEDGE.md))
 - **Multi-Provider LLM**: OpenAI Chat Completions, Responses API, and Agents SDK
 - **Human Agent Handoff**: Flex integration via Interactions API (conversations-v1 mode)
 - **Typing Indicators**: WhatsApp typing indicators via Programmable Messaging API
@@ -101,6 +102,9 @@ cp .env.example .env
 | `TWILIO_CONVERSATIONS_SERVICE_SID` | Conversations Service SID (for v1 mode) | - |
 | `TWILIO_WORKFLOW_SID` | TaskRouter Workflow SID (for Flex handoff) | - |
 | `TWILIO_WORKSPACE_SID` | TaskRouter Workspace SID (for Flex handoff) | - |
+| `KB_FAQ_ID` | Knowledge Base ID for general FAQ | - |
+| `KB_BILLING_ID` | Knowledge Base ID for medical billing | - |
+| `KB_DRIVER_ID` | Knowledge Base ID for driver service | - |
 | `LLM_PROVIDER` | `openai-chat-completions`, `openai-responses`, or `openai-agents` | `openai-chat-completions` |
 | `LLM_MODEL` | OpenAI model | `gpt-4.1` |
 | `OPENAI_MAX_COMPLETION_TOKENS` | Max tokens for LLM responses | - |
@@ -264,6 +268,21 @@ When Maestro capture rules are configured for your phone number, all conversatio
 - **Conversations v1 mode**: Passive capture — Maestro observes the v1 traffic via capture rules
 
 **Important**: To avoid duplicate communications in CI, ensure your Maestro conversation configuration uses `GROUP_BY_PARTICIPANT_ADDRESSES_AND_CHANNEL_TYPE` as the grouping type.
+
+## Enterprise Knowledge
+
+The template integrates with **Twilio Enterprise Knowledge** (Memora) — a managed RAG service that stores, chunks, and semantically searches your content. Each domain (FAQ, billing, driver service) gets its own Knowledge Base and a dedicated search tool, so the LLM can pick the right source based on the question.
+
+**Built-in tools:**
+- `search_support_faq` — general support questions
+- `search_medical_billing` — medical billing concepts
+- `search_driver_service` — Motorista da Rodada info
+
+Each tool is registered dynamically from env vars (`KB_FAQ_ID`, `KB_BILLING_ID`, `KB_DRIVER_ID`) — missing env var = tool not registered, so you can run without any KBs.
+
+**Content** lives in the [knowledge/](knowledge/) directory as markdown files, organized by KB. An uploader script at [scripts/upload-knowledge.ts](scripts/upload-knowledge.ts) walks the directory and creates Twilio Knowledge Sources.
+
+**To add a new KB**, see [KNOWLEDGE.md](KNOWLEDGE.md) — covers creating KBs, uploading sources, registering new tools, best practices, and troubleshooting.
 
 ## LLM Providers
 

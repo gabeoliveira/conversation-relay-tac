@@ -18,6 +18,8 @@ import { switchLanguage } from './switchLanguage.js';
 import { humanAgentHandoff } from './humanAgentHandoff.js';
 import { addSurveyResponse } from './addSurveyResponse.js';
 
+export { buildKnowledgeTools } from './knowledgeTools.js';
+
 // ─── Tool Definitions ────────────────────────────────────────────────────────
 
 export const bookDriverTool = defineTool(

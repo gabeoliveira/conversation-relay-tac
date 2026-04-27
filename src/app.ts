@@ -41,8 +41,15 @@ export interface AppOptions {
   /** System prompt — defines the AI persona and guidelines */
   systemPrompt: string;
 
-  /** Tools the LLM can call */
+  /** Static tools the LLM can call */
   tools: TACTool[];
+
+  /**
+   * Optional factory for tools that need access to the TAC instance
+   * (e.g., knowledge base search tools). Called after TAC is initialized,
+   * and the returned tools are appended to `tools`.
+   */
+  buildDynamicTools?: (tac: TAC) => TACTool[];
 
   /** Dynamic context injected on each message (e.g., current date/time). Defaults to date/time. */
   additionalContext?: () => string;
@@ -52,6 +59,13 @@ export interface AppOptions {
 
   /** Welcome greeting for voice calls */
   welcomeGreeting?: string;
+
+  /**
+   * Additional ConversationRelay attributes to merge into the TwiML.
+   * These override defaults set by createApp(). Use this for advanced settings
+   * like intelligenceService, interruptSensitivity, preemptible, debug, etc.
+   */
+  conversationRelayConfig?: Record<string, unknown>;
 }
 
 // ─── createApp ───────────────────────────────────────────────────────────────
@@ -59,10 +73,12 @@ export interface AppOptions {
 export function createApp(options: AppOptions): void {
   const {
     systemPrompt,
-    tools,
+    tools: staticTools,
+    buildDynamicTools,
     additionalContext = getAdditionalContext,
     defaultLanguage = languageOptions.portuguese,
     welcomeGreeting = config.welcomeGreeting,
+    conversationRelayConfig: extraRelayConfig = {},
   } = options;
 
   // ─── Initialize TAC ────────────────────────────────────────────────────────
@@ -72,6 +88,11 @@ export function createApp(options: AppOptions): void {
   const tac = new TAC({ config: TACConfig.fromEnv() });
   const voiceChannel = new VoiceChannel(tac);
   tac.registerChannel(voiceChannel);
+
+  // Build final tools list — static + dynamic (e.g. knowledge tools that need tac)
+  const tools: TACTool[] = buildDynamicTools
+    ? [...staticTools, ...buildDynamicTools(tac)]
+    : staticTools;
 
   let smsChannel: InstanceType<typeof SMSChannel> | undefined;
   let whatsappChannel: InstanceType<typeof WhatsAppChannel> | undefined;
@@ -392,6 +413,7 @@ export function createApp(options: AppOptions): void {
       transcriptionProvider: defaultLanguage.transcriptionProvider,
       transcriptionLanguage: defaultLanguage.transcriptionLanguage,
       speechModel: defaultLanguage.speechModel,
+      ...extraRelayConfig,
     },
     development: true,
   });
