@@ -25,6 +25,8 @@ import {
   ConversationId,
   ConversationSession,
   TACMemoryResponse,
+  MemoryPromptBuilder,
+  createStudioHandoffTool,
 } from 'twilio-agent-connect';
 import type { TACTool } from 'twilio-agent-connect';
 
@@ -70,7 +72,7 @@ export interface AppOptions {
 
 // ─── createApp ───────────────────────────────────────────────────────────────
 
-export function createApp(options: AppOptions): void {
+export async function createApp(options: AppOptions): Promise<void> {
   const {
     systemPrompt,
     tools: staticTools,
@@ -85,21 +87,28 @@ export function createApp(options: AppOptions): void {
 
   const isMaestroMode = config.messagingMode === 'maestro';
 
-  const tac = new TAC({ config: TACConfig.fromEnv() });
-  const voiceChannel = new VoiceChannel(tac);
+  const tac = await TAC.create({ config: TACConfig.fromEnv() });
+  // memoryMode defaults to 'never' in TAC 1.0.0+. Opt in to per-message memory
+  // retrieval so onMessageReady callbacks receive a populated `memory` argument.
+  const voiceChannel = new VoiceChannel(tac, { memoryMode: 'always' });
   tac.registerChannel(voiceChannel);
 
-  // Build final tools list — static + dynamic (e.g. knowledge tools that need tac)
+  // Build final tools list — static + dynamic (e.g. knowledge tools that need tac).
+  // In Maestro mode, the OOTB createStudioHandoffTool replaces the legacy
+  // humanAgentHandoffTool — strip the legacy one so they don't compete.
   const tools: TACTool[] = buildDynamicTools
     ? [...staticTools, ...buildDynamicTools(tac)]
     : staticTools;
+  const baseTools: TACTool[] = isMaestroMode
+    ? tools.filter(t => t.name !== 'human_agent_handoff')
+    : tools;
 
-  let smsChannel: InstanceType<typeof SMSChannel> | undefined;
-  let whatsappChannel: InstanceType<typeof WhatsAppChannel> | undefined;
+  let smsChannel: SMSChannel | undefined;
+  let whatsappChannel: WhatsAppChannel | undefined;
 
   if (isMaestroMode) {
-    smsChannel = new SMSChannel(tac);
-    whatsappChannel = new WhatsAppChannel(tac);
+    smsChannel = new SMSChannel(tac, { memoryMode: 'always' });
+    whatsappChannel = new WhatsAppChannel(tac, { memoryMode: 'always' });
     tac.registerChannel(smsChannel);
     tac.registerChannel(whatsappChannel);
   }
@@ -107,7 +116,10 @@ export function createApp(options: AppOptions): void {
   // ─── LLM Provider per conversation ──────────────────────────────────────────
 
   const providers = new Map<string, LLMProvider>();
-  const aiParticipantRegistered = new Set<string>();
+  // Last channel we told the LLM about, per conversation. Re-injected on
+  // change so the agent adapts style when the customer moves between voice
+  // and messaging mid-conversation (GROUP_BY_PROFILE keeps the same convId).
+  const lastChannelByConversation = new Map<string, string>();
 
   async function getProvider(conversationId: ConversationId): Promise<LLMProvider> {
     const key = conversationId as string;
@@ -132,10 +144,10 @@ export function createApp(options: AppOptions): void {
 
         const authHeader =
           'Basic ' +
-          Buffer.from(`${tacConfig.twilioAccountSid}:${tacConfig.twilioAuthToken}`).toString('base64');
+          Buffer.from(`${tacConfig.accountSid}:${tacConfig.authToken}`).toString('base64');
 
         const listUrl = new URL(
-          `https://api.twilio.com/2010-04-01/Accounts/${tacConfig.twilioAccountSid}/Messages.json`
+          `https://api.twilio.com/2010-04-01/Accounts/${tacConfig.accountSid}/Messages.json`
         );
         listUrl.searchParams.set('From', customerPhone);
         listUrl.searchParams.set('PageSize', '1');
@@ -169,49 +181,21 @@ export function createApp(options: AppOptions): void {
 
   function injectMemoryContext(
     provider: LLMProvider,
-    memory: TACMemoryResponse,
+    memory: TACMemoryResponse | undefined,
     session: ConversationSession
   ): void {
-    const parts: string[] = [];
+    const contextString = MemoryPromptBuilder.build(memory, session);
+    console.log('[MemoryContext] profileId=%s | traits=%s | observations=%d | summaries=%d | communications=%d',
+      session.profileId ?? 'none',
+      session.profile?.traits ? JSON.stringify(session.profile.traits) : 'none',
+      memory?.observations.length ?? 0,
+      memory?.summaries.length ?? 0,
+      memory?.communications.length ?? 0
+    );
+    console.log('[MemoryContext] System context being injected:\n%s', contextString || '(empty)');
 
-    if (memory.observations.length > 0) {
-      parts.push('User observations:');
-      for (const obs of memory.observations.slice(0, 5)) {
-        parts.push(`- ${obs.content}`);
-      }
-    }
-
-    if (memory.summaries.length > 0) {
-      parts.push('\nConversation summaries:');
-      for (const summary of memory.summaries.slice(0, 3)) {
-        parts.push(`- ${summary.content}`);
-      }
-    }
-
-    if (memory.communications.length > 0) {
-      parts.push('\nRecent conversation history:');
-      for (const comm of memory.communications.slice(0, 10)) {
-        const author = comm.author?.name || 'Unknown';
-        const content = comm.content?.text || '';
-        if (content) parts.push(`${author}: ${content}`);
-      }
-    }
-
-    if (session.profileId) {
-      parts.push(`\nProfile ID: ${session.profileId}`);
-    }
-
-    if (session.profile?.traits) {
-      parts.push('\nUser profile:');
-      for (const [key, value] of Object.entries(session.profile.traits)) {
-        if (value !== null && value !== undefined) {
-          parts.push(`${key}: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`);
-        }
-      }
-    }
-
-    if (parts.length > 0) {
-      provider.addSystemContext(parts.join('\n'));
+    if (contextString) {
+      provider.addSystemContext(contextString);
     }
   }
 
@@ -229,10 +213,11 @@ export function createApp(options: AppOptions): void {
 
     switch (action.type) {
       case 'handoff':
-        console.log(`[Action] Triggering handoff: ${action.reason}`);
-        if (isMaestroMode) {
-          await tac.triggerHandoff(conversationId, action.reason);
-        } else {
+        // In Maestro mode, the LLM calls the OOTB liveAgentHandoff tool directly
+        // (createStudioHandoffTool) — no action dispatch needed here. Conversations
+        // v1 mode still uses the legacy handleHandoff path until v1 is retired.
+        if (!isMaestroMode) {
+          console.log(`[Action] Triggering v1 handoff: ${action.reason}`);
           await handleHandoff(conversationId as string, action.reason, undefined, tac);
         }
         break;
@@ -251,8 +236,22 @@ export function createApp(options: AppOptions): void {
 
   tac.onMessageReady(async ({ conversationId, message, memory, session, channel }) => {
     console.log(`[TAC] Message from ${channel}: "${message.substring(0, 80)}..."`);
+    console.log('[TAC] Inbound session: profileId=%s | hasProfile=%s | memoryProvided=%s',
+      session.profileId ?? 'none',
+      session.profile ? 'yes' : 'no',
+      memory ? 'yes' : 'no'
+    );
 
     const provider = await getProvider(conversationId);
+
+    // Inject the current channel so the LLM can adapt its style. Only
+    // re-inject when the channel changes (first turn, or cross-channel
+    // transition like WhatsApp → voice on the same conversation).
+    const convKey = conversationId as string;
+    if (lastChannelByConversation.get(convKey) !== channel) {
+      lastChannelByConversation.set(convKey, channel);
+      provider.addSystemContext(`Current communication channel: ${channel}`);
+    }
 
     // Fetch profile traits if we have a profileId but no profile yet
     if (session.profileId && !session.profile) {
@@ -260,16 +259,48 @@ export function createApp(options: AppOptions): void {
         const profileResponse = await tac.fetchProfile(session.profileId);
         if (profileResponse) {
           session.profile = { profileId: profileResponse.id, traits: profileResponse.traits };
+          console.log('[TAC] Profile fetched: %s', JSON.stringify(profileResponse.traits));
         }
       } catch (err) {
-        console.warn(`[TAC] Failed to fetch profile for ${session.profileId}:`, err);
+        // Swallowed — fall through to address-based lookup below.
       }
     }
 
-    // Inject memory context if available
-    if (memory) {
-      injectMemoryContext(provider, memory, session);
+    // Fallback: if we still don't have a profile, look it up by phone (E.164)
+    // derived from session.authorInfo.address. Recovers from two common gaps:
+    //   1. Stale participant.profileId pointing at a profile in a previous
+    //      memory store (cross-store migration leftovers).
+    //   2. WhatsApp Business Calling: TAC uses idType=phone for VOICE channel,
+    //      but the call's address is `whatsapp:+...`. Stripping the prefix
+    //      lets the phone-identity lookup succeed.
+    if (!session.profile && session.authorInfo?.address) {
+      const memoryClient = tac.getMemoryClient();
+      if (memoryClient) {
+        const phoneE164 = session.authorInfo.address.replace(/^whatsapp:/i, '');
+        if (phoneE164.startsWith('+')) {
+          try {
+            const lookup = await memoryClient.lookupProfile('phone', phoneE164);
+            const resolvedId = lookup.profiles?.[0];
+            if (resolvedId) {
+              const profileResponse = await tac.fetchProfile(resolvedId);
+              if (profileResponse) {
+                session.profileId = resolvedId;
+                session.profile = { profileId: profileResponse.id, traits: profileResponse.traits };
+                console.log('[TAC] Profile recovered via address lookup: %s', JSON.stringify(profileResponse.traits));
+              }
+            } else {
+              console.warn('[TAC] No profile found for %s', phoneE164);
+            }
+          } catch (err) {
+            console.warn(`[TAC] Address-based profile lookup failed for ${phoneE164}:`, err);
+          }
+        }
+      }
     }
+
+    // Inject context (profile traits + memory if any). injectMemoryContext
+    // handles undefined memory gracefully — profile traits alone still go through.
+    injectMemoryContext(provider, memory, session);
 
     // Inject customer phone for messaging channels
     if (channel !== 'voice' && session.authorInfo?.address) {
@@ -280,51 +311,45 @@ export function createApp(options: AppOptions): void {
         sendWhatsAppTypingIndicator(session.authorInfo.address);
       }
       provider.addSystemContext(`Customer phone: ${customerPhone}`);
-
-      // Register AI agent participant on first message (Maestro mode only)
-      if (isMaestroMode) {
-        const convKey = conversationId as string;
-        if (!aiParticipantRegistered.has(convKey)) {
-          aiParticipantRegistered.add(convKey);
-          const tacConfig = tac.getConfig();
-          const agentAddress = channel === 'whatsapp'
-            ? tacConfig.twilioWhatsAppNumber!
-            : tacConfig.twilioPhoneNumber;
-          const agentChannel = channel === 'whatsapp' ? 'WHATSAPP' : 'SMS';
-          try {
-            await tac.getConversationClient().addParticipant(
-              convKey,
-              [{ channel: agentChannel, address: agentAddress }],
-              'AI_AGENT'
-            );
-          } catch (err) {
-            console.warn(`[TAC] Failed to register AI agent participant:`, err);
-          }
-        }
-      }
+      // TAC 1.0.0 auto-reconciles the AI agent participant on inbound webhooks
+      // via MessagingChannel.reconcileParticipants — no manual addParticipant needed.
     }
 
+    // Per-session tools: handoff tool needs session in closure. Built fresh per
+    // message — cheap, and `session` may be mutated mid-conversation as profile
+    // resolves. Voice path also gets the tool: handoff sets pendingHandoffData
+    // and the WebSocket gracefully closes, redirecting the call to Studio.
+    // Only added in Maestro mode (the tool throws if Conversation Orchestrator
+    // isn't initialized).
+    const callTools: TACTool[] = isMaestroMode
+      ? [...baseTools, createStudioHandoffTool(tac, session, { name: 'liveAgentHandoff' })]
+      : baseTools;
+
     if (channel === 'voice') {
-      // ── Voice: stream tokens to WebSocket ──
       const streamController = voiceChannel.startStreamTask(conversationId);
 
       try {
-        for await (const token of provider.streamResponse(message, tools, streamController.signal)) {
-          if (streamController.signal.aborted) break;
-          if (token) {
-            voiceChannel.sendResponse(conversationId, token, { last: false });
-          }
-        }
-        // Send empty token with last: true to signal end of stream
-        if (!streamController.signal.aborted) {
-          voiceChannel.sendResponse(conversationId, '', { last: true });
-        }
+        await voiceChannel.sendStreamingResponse(
+          conversationId,
+          provider.streamResponse(message, callTools, streamController.controller.signal),
+          { signal: streamController.controller.signal }
+        );
       } catch (err) {
-        if (!streamController.signal.aborted) {
+        if (!streamController.controller.signal.aborted) {
           console.error(`[Voice] Stream error for ${conversationId}:`, err);
         }
       } finally {
         voiceChannel.completeStreamTask(conversationId);
+      }
+
+      // Workaround for TAC 1.0.0: sendStreamingResponse doesn't dispatch
+      // session.pendingHandoffData (only sendResponse does). If the LLM called
+      // the handoff tool mid-stream, force the dispatch by issuing an empty
+      // sendResponse — which sees pendingHandoffData and emits the WS `end`
+      // message that triggers ConversationRelay's <Connect action> redirect.
+      if (session.pendingHandoffData) {
+        console.log('[Voice] Dispatching pending handoff data to ConversationRelay');
+        await voiceChannel.sendResponse(conversationId, '');
       }
 
       await handlePostCompletion(provider, conversationId, channel);
@@ -333,7 +358,7 @@ export function createApp(options: AppOptions): void {
       // ── Messaging (SMS / WhatsApp) via Maestro ──
       const messagingChannel = channel === 'whatsapp' ? whatsappChannel! : smsChannel!;
       try {
-        const response = await provider.generateResponse(message, tools);
+        const response = await provider.generateResponse(message, callTools);
         await messagingChannel.sendResponse(conversationId, response);
         await handlePostCompletion(provider, conversationId, channel);
       } catch (err) {
@@ -344,8 +369,8 @@ export function createApp(options: AppOptions): void {
 
   // ─── Voice Interrupt Handler ────────────────────────────────────────────────
 
-  tac.onInterrupt(async ({ conversationId, reason, utteranceUntilInterrupt }) => {
-    console.log(`[TAC] Interrupt on ${conversationId}: ${reason}`);
+  tac.onInterrupt(async ({ conversationId, utteranceUntilInterrupt }) => {
+    console.log(`[TAC] Interrupt on ${conversationId}`);
 
     // Tell the LLM what the customer actually heard before interrupting
     if (utteranceUntilInterrupt) {
@@ -363,19 +388,15 @@ export function createApp(options: AppOptions): void {
   tac.onConversationEnded(async ({ session }) => {
     const key = session.conversationId as string;
     providers.delete(key);
+    lastChannelByConversation.delete(key);
     console.log(`[TAC] Conversation ended: ${session.conversationId}`);
   });
 
-  // ─── Handoff Handler ────────────────────────────────────────────────────────
-
-  tac.onHandoff(async ({ conversationId, reason, session }) => {
-    console.log(`[TAC] Handoff requested for ${conversationId}: ${reason}`);
-
-    if (!isMaestroMode) {
-      const customerPhone = session.authorInfo?.address;
-      await handleHandoff(conversationId as string, reason, customerPhone);
-    }
-  });
+  // ─── Handoff ────────────────────────────────────────────────────────────────
+  // tac.onHandoff was removed in twilio-agent-connect@1.0.0. Handoff is now
+  // tool-driven via createStudioHandoffTool(tac, session). For Maestro mode,
+  // add it to the LLM tools list. For Conversations v1, handleHandoff is
+  // invoked directly from handlePostCompletion above.
 
   // ─── Voice Setup Callback ──────────────────────────────────────────────────
 
@@ -399,10 +420,8 @@ export function createApp(options: AppOptions): void {
   // ─── Start Server ──────────────────────────────────────────────────────────
 
   const server = new TACServer(tac, {
-    voice: {
-      host: '0.0.0.0',
-      port: config.server.port,
-    },
+    host: '0.0.0.0',
+    port: config.server.port,
     conversationRelayConfig: {
       welcomeGreeting,
       dtmfDetection: true,
@@ -415,11 +434,10 @@ export function createApp(options: AppOptions): void {
       speechModel: defaultLanguage.speechModel,
       ...extraRelayConfig,
     },
-    development: true,
   });
 
   if (!isMaestroMode) {
-    registerConversationsV1Routes(server.app, {
+    registerConversationsV1Routes(server.fastify, {
       tac,
       tools,
       getProvider,

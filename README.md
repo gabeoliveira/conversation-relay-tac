@@ -83,21 +83,20 @@ cp .env.example .env
 |---|---|---|
 | `TWILIO_ACCOUNT_SID` | Your Twilio Account SID | `ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` |
 | `TWILIO_AUTH_TOKEN` | Your Twilio Auth Token | `your_auth_token` |
-| `API_KEY` | Twilio API Key | `SKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` |
-| `API_TOKEN` | Twilio API Token | `your_api_token` |
+| `TWILIO_API_KEY` | Twilio API Key SID | `SKxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` |
+| `TWILIO_API_SECRET` | Twilio API Key Secret | `your_api_secret` |
 | `TWILIO_PHONE_NUMBER` | Your Twilio phone number (voice/SMS) | `+1234567890` |
 | `TWILIO_WHATSAPP_NUMBER` | Your WhatsApp sender | `whatsapp:+1234567890` |
-| `CONVERSATION_SERVICE_ID` | Maestro conversation configuration ID | `conv_configuration_xxxxx` |
+| `TWILIO_CONVERSATION_CONFIGURATION_ID` | Maestro conversation configuration ID | `conv_configuration_xxxxx` |
 | `OPENAI_API_KEY` | Your OpenAI API Key | `sk-...` |
 
 #### Optional Variables
 
 | Variable | Description | Default |
 |---|---|---|
-| `ENVIRONMENT` | TAC environment (`dev`, `stage`, `prod`) | `prod` |
-| `MEMORY_STORE_ID` | Memora memory store ID | - |
-| `TRAIT_GROUPS` | Comma-separated trait group names for profile fetch | - |
-| `VOICE_PUBLIC_DOMAIN` | Public URL for voice webhooks (ngrok URL) | - |
+| `TWILIO_MEMORY_PROFILE_TRAIT_GROUPS` | Comma-separated trait group names for profile fetch | - |
+| `TWILIO_REGION` | Twilio region subdomain for API routing (rarely needed) | - |
+| `TWILIO_VOICE_PUBLIC_DOMAIN` | Public domain for voice WebSocket (no protocol/port/path, e.g. `abc123.ngrok.app`) | - |
 | `MESSAGING_MODE` | `maestro` or `conversations-v1` | `maestro` |
 | `TWILIO_CONVERSATIONS_SERVICE_SID` | Conversations Service SID (for v1 mode) | - |
 | `TWILIO_WORKFLOW_SID` | TaskRouter Workflow SID (for Flex handoff) | - |
@@ -392,17 +391,16 @@ Maestro (Conversations v2) is the modern path — active conversation management
 
 Maestro still runs passively in v1 mode, so CI and memory work regardless.
 
-### Why a custom WhatsAppChannel?
-
-TAC ships with `SMSChannel` but not a WhatsApp-specific channel. WhatsApp needs:
-- A separate sender number (`TWILIO_WHATSAPP_NUMBER` with `whatsapp:` prefix)
-- `channel: 'WHATSAPP'` in the Send API payloads
-- WhatsApp-specific typing indicators
-- Author filtering against the `whatsapp:`-prefixed number
-
 ### Why fetch profile at handoff time?
 
 Profile traits (customer name) are needed for the Flex task `name` attribute. Rather than caching trait data in memory and risking staleness, the handoff calls `tac.fetchProfile()` at the moment of handoff — ensuring the latest data from Memora.
+
+## Known limitations
+
+- **WhatsApp Business Calling — first 1-2s of greeting may clip.** Meta's WhatsApp calling API takes a moment to establish the audio path after SIP connects. Working around this requires a custom `<Pause>` injected before `<Connect>` in the TwiML; not currently available OOTB.
+- **Memory retrieval is opt-in.** TAC 1.0.0 defaults channel `memoryMode` to `'never'` so customers aren't billed for Memory API calls they didn't ask for. The template opts in (`new VoiceChannel(tac, { memoryMode: 'always' })`) so the LLM receives memory context on every turn. Tradeoff: ~500ms-2s of Memory API latency + per-call billing per inbound message. There's no "once per conversation" mode upstream yet (filed as an upstream PR candidate).
+- **Maestro handoff is no-op.** `tac.triggerHandoff()` was removed in `twilio-agent-connect@1.0.0` in favor of the tool-based pattern. To enable LLM-driven handoff in Maestro mode, add `createStudioHandoffTool(tac, session)` to your tools list.
+- **Deepgram-specific ConversationRelay attrs unavailable.** `deepgramSmartFormat` and `speechTimeout` are not in TAC 1.0.0's schema, and `reportInputDuringAgentSpeech` is boolean-only (the TwiML spec also accepts `'any' | 'speech' | 'none'`). File an upstream PR or use `patch-package` if you need them.
 
 ## License
 

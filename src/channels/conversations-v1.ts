@@ -43,7 +43,7 @@ interface ConversationsV1Options {
   tools: import('twilio-agent-connect').TACTool[];
   getProvider: (conversationId: ConversationId) => Promise<LLMProvider>;
   handlePostCompletion: (provider: LLMProvider, conversationId: ConversationId, channel: string) => Promise<void>;
-  injectMemoryContext: (provider: LLMProvider, memory: TACMemoryResponse, session: ConversationSession) => void;
+  injectMemoryContext: (provider: LLMProvider, memory: TACMemoryResponse | undefined, session: ConversationSession) => void;
 }
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -164,7 +164,7 @@ export async function handleHandoff(
   conversationSid: string,
   reason: string,
   customerPhone?: string,
-  tac?: InstanceType<typeof import('twilio-agent-connect').TAC>
+  tac?: import('twilio-agent-connect').TAC
 ): Promise<void> {
   try {
     const v1Session = v1Sessions.get(conversationSid);
