@@ -16,7 +16,7 @@ An AI-powered conversational assistant built on **Twilio Agent Connect (TAC)** t
 | **Messaging outbound** | Conversations v1 `messages.create()` | Maestro Send API or Conversations v1 (configurable) |
 | **Voice** | ConversationRelay WebSocket | ConversationRelay WebSocket (via TAC `VoiceChannel`) |
 | **Memory** | None | Memora observations, summaries, profile traits |
-| **Human handoff** | Interactions API + webhook removal | Interactions API + webhook removal (conversations-v1 mode) |
+| **Human handoff** | Interactions API + webhook removal | Studio Flow tool in Maestro mode (routes to Flex or anywhere); Interactions API + webhook removal in conversations-v1 mode |
 | **Webhook validation** | Custom middleware | TAC built-in |
 
 ## Features
@@ -28,7 +28,7 @@ An AI-powered conversational assistant built on **Twilio Agent Connect (TAC)** t
 - **Customer Memory**: Automatic Memora integration — observations, summaries, profile traits
 - **Enterprise Knowledge**: Domain-scoped knowledge base search via dynamically registered tools (see [KNOWLEDGE.md](KNOWLEDGE.md))
 - **Multi-Provider LLM**: OpenAI Chat Completions, Responses API, and Agents SDK
-- **Human Agent Handoff**: Flex integration via Interactions API (conversations-v1 mode)
+- **Human Agent Handoff**: Studio Flow-based handoff in Maestro mode (LLM tool `liveAgentHandoff`, routes to Flex / queues / a different number / any Studio widget); direct Flex Interactions API in conversations-v1 mode
 - **Typing Indicators**: WhatsApp typing indicators via Programmable Messaging API
 - **Tool System**: Extensible tools using TAC's `defineTool` / `TACTool`
 - **Conversation Intelligence**: Maestro passive capture feeds CI operators
@@ -101,8 +101,9 @@ cp .env.example .env
 | `TWILIO_VOICE_PUBLIC_DOMAIN` | Public domain for voice WebSocket (no protocol/port/path, e.g. `abc123.ngrok.app`) | - |
 | `MESSAGING_MODE` | `maestro` or `conversations-v1` | `maestro` |
 | `TWILIO_CONVERSATIONS_SERVICE_SID` | Conversations Service SID (for v1 mode) | - |
-| `TWILIO_WORKFLOW_SID` | TaskRouter Workflow SID (for Flex handoff) | - |
-| `TWILIO_WORKSPACE_SID` | TaskRouter Workspace SID (for Flex handoff) | - |
+| `TWILIO_WORKFLOW_SID` | TaskRouter Workflow SID (for Flex handoff in v1 mode) | - |
+| `TWILIO_WORKSPACE_SID` | TaskRouter Workspace SID (for Flex handoff in v1 mode) | - |
+| `TWILIO_STUDIO_HANDOFF_FLOW_SID` | Studio Flow SID (used by `createStudioHandoffTool` in Maestro mode — one Flow handles both voice `incomingCall` and messaging REST triggers) | - |
 | `KB_FAQ_ID` | Knowledge Base ID for general FAQ | - |
 | `KB_BILLING_ID` | Knowledge Base ID for medical billing | - |
 | `KB_DRIVER_ID` | Knowledge Base ID for driver service | - |
@@ -155,7 +156,7 @@ This application supports two mutually exclusive messaging modes, controlled by 
 - TAC's `WhatsAppChannel` and `SMSChannel` process Maestro v2 webhook events
 - Outbound messages sent via Maestro Send API (`POST /v2/Communications`)
 - Memory, CI, and profile traits all flow through Maestro natively
-- **No Flex handoff support** — Flex requires Conversations v1
+- **Handoff via Studio Flow** — TAC's `createStudioHandoffTool` is added automatically and surfaced to the LLM as `liveAgentHandoff`. Works for both voice (`incomingCall` trigger) and messaging (REST trigger). The Studio Flow then routes to Flex, a queue, a different number, or any other Studio widget — `TWILIO_STUDIO_HANDOFF_FLOW_SID` controls the destination. Direct Flex Interactions-API handoff (without Studio) is v1-only.
 
 ### Conversations v1 Mode (`MESSAGING_MODE=conversations-v1`)
 
@@ -163,15 +164,16 @@ This application supports two mutually exclusive messaging modes, controlled by 
 - Custom webhook handler at `/conversations-webhook` processes `onMessageAdded` events
 - Outbound messages sent via `client.conversations.v1.conversations(sid).messages.create()`
 - Maestro runs passively (capture rules observe traffic for CI and memory)
-- **Full Flex handoff support** via Interactions API
+- **Direct Flex Interactions-API handoff** — the legacy `human_agent_handoff` tool creates a Flex Interaction directly, links it to the existing v1 conversation, and strips bot webhooks. No Studio Flow needed.
 - TAC is still used for: memory retrieval, profile lookup, tool definitions, LLM providers, voice
 
 ### Choosing a Mode
 
 | Use Case | Recommended Mode |
 |---|---|
-| AI-only (no human escalation) | `maestro` |
-| Flex handoff required | `conversations-v1` |
+| AI-only, no escalation needed | `maestro` |
+| Human escalation via Studio Flow (Flex, queue, callback, IVR) | `maestro` — `liveAgentHandoff` tool + a Studio Flow you control |
+| Direct Flex handoff via Interactions API (no Studio) | `conversations-v1` |
 | Conversation Intelligence only | Either (Maestro passive in v1 mode) |
 | Voice + messaging | Either (voice always uses TAC) |
 
@@ -240,7 +242,23 @@ Customer (WhatsApp/SMS/Voice)
 
 ## Human Agent Handoff
 
-Handoff is supported in **conversations-v1 mode** and follows this flow:
+Both messaging modes support handoff, with different mechanisms.
+
+### Maestro mode — Studio Flow handoff (default)
+
+In Maestro mode the template wires TAC's OOTB `createStudioHandoffTool` automatically (see [src/app.ts:426](src/app.ts#L426)). The tool is exposed to the LLM under the name **`liveAgentHandoff`**.
+
+1. **LLM calls `liveAgentHandoff`** — usually with a short reason string.
+2. **TAC redirects the call/conversation to a Studio Flow** identified by `TWILIO_STUDIO_HANDOFF_FLOW_SID`:
+   - Voice: ConversationRelay receives an `end` message with handoff data; the call is redirected via `<Connect action>` to the Studio Flow's `incomingCall` trigger.
+   - Messaging: the conversation is handed to the Studio Flow via REST trigger.
+3. **The Studio Flow takes it from there.** This is the key flexibility — one Flow can route to Flex (via Send to Flex widget), an external IVR queue, a different number, a callback workflow, or any combination depending on the reason or business hours. The template doesn't prescribe a routing strategy; you design it in Studio.
+
+This mode is the right choice for most deployments: Flex isn't required, and the Studio Flow gives non-engineers a place to change the routing without touching code.
+
+### Conversations v1 mode — direct Flex Interactions API
+
+In v1 mode, the legacy `human_agent_handoff` tool stays in the tool list (in Maestro mode it's filtered out) and goes through this flow:
 
 1. **LLM triggers `human_agent_handoff` tool** — the tool returns a confirmation, and the provider records it as a side-effect action
 2. **Post-completion routing** — `handlePostCompletion()` detects the handoff action and calls `handleHandoff()`
@@ -248,6 +266,8 @@ Handoff is supported in **conversations-v1 mode** and follows this flow:
 4. **Bot webhooks removed** — all webhooks matching the ngrok domain are removed from the conversation so the bot stops receiving messages
 5. **Conversation marked** — attributes updated with `handedOff: true`, interaction SID, and timestamp
 6. **Customer name resolution** — the Flex task `name` attribute is populated from Memora profile traits (`firstName` + `lastName`), falling back to the customer phone number
+
+This path is required when you need to hit Flex's Interactions API directly (no Studio Flow in between).
 
 ## Customer Memory (Memora)
 
@@ -413,7 +433,7 @@ Tools are defined using TAC's `defineTool()` and executed via a unified `execute
 | `check_payment_options` | Gets available payment options |
 | `search_common_medical_terms` | Searches medical terminology |
 | `switch_language` | Switches conversation language |
-| `human_agent_handoff` | Transfers to a Flex agent |
+| `liveAgentHandoff` (Maestro) / `human_agent_handoff` (v1) | Transfers to a human. Maestro mode adds TAC's OOTB `createStudioHandoffTool` automatically — routes via Studio Flow (`TWILIO_STUDIO_HANDOFF_FLOW_SID`). v1 mode uses the legacy tool that hits Flex Interactions API directly. |
 | `add_survey_response` | Records CSAT survey responses |
 
 ## API Endpoints
@@ -575,7 +595,7 @@ Cost: one delta of latency. Benefit: dramatically smoother TTS, plus correct pro
 
 - **WhatsApp Business Calling — first 1-2s of greeting may clip.** Meta's WhatsApp calling API takes a moment to establish the audio path after SIP connects. Working around this requires a custom `<Pause>` injected before `<Connect>` in the TwiML; not currently available OOTB.
 - **Memory retrieval mode** is controlled by `MEMORY_RECALL_MODE` (default `always`). TAC 1.0.0 itself only ships `'always' | 'never'` so customers aren't billed for Memory API calls they didn't ask for. The template adds a third option, `'first-prompt'`, that recalls memory once per conversation and reuses the cached response on subsequent turns — same context for the LLM, dramatically lower Memory API cost on long conversations. Tradeoff: observations/summaries added mid-conversation (e.g., by Conversation Intelligence) won't appear until the next conversation. Filed upstream as a TAC PR candidate.
-- **Maestro handoff is no-op.** `tac.triggerHandoff()` was removed in `twilio-agent-connect@1.0.0` in favor of the tool-based pattern. To enable LLM-driven handoff in Maestro mode, add `createStudioHandoffTool(tac, session)` to your tools list.
+- **Maestro handoff requires a Studio Flow.** `tac.triggerHandoff()` was removed in `twilio-agent-connect@1.0.0` in favor of the tool-based pattern. The template wires `createStudioHandoffTool(tac, session, { name: 'liveAgentHandoff' })` automatically in Maestro mode, so handoff works out of the box — *provided* `TWILIO_STUDIO_HANDOFF_FLOW_SID` points at a Studio Flow that handles both `incomingCall` (voice) and REST (messaging) triggers. Without the Flow SID set the tool throws at runtime. If you need to skip Studio entirely and call Flex's Interactions API directly, use `MESSAGING_MODE=conversations-v1`.
 - **Deepgram-specific ConversationRelay attrs unavailable.** `deepgramSmartFormat` and `speechTimeout` are not in TAC 1.0.0's schema, and `reportInputDuringAgentSpeech` is boolean-only (the TwiML spec also accepts `'any' | 'speech' | 'none'`). File an upstream PR or use `patch-package` if you need them.
 
 ## License
