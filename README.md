@@ -32,6 +32,7 @@ An AI-powered conversational assistant built on **Twilio Agent Connect (TAC)** t
 - **Typing Indicators**: WhatsApp typing indicators via Programmable Messaging API
 - **Tool System**: Extensible tools using TAC's `defineTool` / `TACTool`
 - **Conversation Intelligence**: Maestro passive capture feeds CI operators
+- **Humanization patterns**: Word-boundary TTS streaming, message debouncing, eager typing indicators, interrupt-aware context, channel-adaptive output (see [HUMANIZING_AGENTS.md](HUMANIZING_AGENTS.md))
 
 ## Prerequisites
 
@@ -96,6 +97,7 @@ cp .env.example .env
 |---|---|---|
 | `TWILIO_MEMORY_PROFILE_TRAIT_GROUPS` | Comma-separated trait group names for profile fetch | - |
 | `TWILIO_REGION` | Twilio region subdomain for API routing (rarely needed) | - |
+| `MEMORY_RECALL_MODE` | Memory recall strategy: `always`, `never`, or `first-prompt` (template-level, recall once per conversation) | `always` |
 | `TWILIO_VOICE_PUBLIC_DOMAIN` | Public domain for voice WebSocket (no protocol/port/path, e.g. `abc123.ngrok.app`) | - |
 | `MESSAGING_MODE` | `maestro` or `conversations-v1` | `maestro` |
 | `TWILIO_CONVERSATIONS_SERVICE_SID` | Conversations Service SID (for v1 mode) | - |
@@ -268,6 +270,103 @@ When Maestro capture rules are configured for your phone number, all conversatio
 
 **Important**: To avoid duplicate communications in CI, ensure your Maestro conversation configuration uses `GROUP_BY_PARTICIPANT_ADDRESSES_AND_CHANNEL_TYPE` as the grouping type.
 
+## Inbound Media (Audio & Image)
+
+WhatsApp customers can send voice notes and images (medication photos, document scans, receipts, etc.). Maestro's Conversation Orchestrator drops media attachments — only text bodies enter the conversation. To make audio + images reach the LLM and CI operators, the template runs a second webhook outside Maestro that runs the media through the appropriate model (Whisper for audio, GPT-4o-mini vision for images) and inserts the result back as a customer-attributed Communication.
+
+The agent treats the transcribed audio or described image as a normal turn. CI operators run on it. Memora extracts observations from it. From everyone downstream of CO, it's indistinguishable from a real text message.
+
+### Pipeline
+
+```
+WhatsApp customer sends audio or image
+  │
+  ├──── Maestro / CO ────────────────────────────────────────────────────────────
+  │     Drops the media. No COMMUNICATION_CREATED fires for media-only.
+  │     (CO will however fire COMMUNICATION_CREATED for the *inserted* text
+  │      message later in this pipeline — see step 5 below.)
+  │
+  └──── Programmable Messaging webhook ──────────────────────────────────────────
+        POST /inbound-message  (template-managed, signed)
+        │
+        1. Validate X-Twilio-Signature against TAC's auth token
+        2. Download media via Twilio Basic Auth (API_KEY / API_SECRET)
+        3. Run the appropriate model:
+              audio/*  →  Whisper transcription                      → text
+              image/*  →  Vision model (gpt-4o-mini) + custom prompt → text
+        4. Find the active CO conversation for the customer/agent address pair
+        5. POST /v2/Conversations/{id}/Communications with:
+             author     = customer participant (full address + participantId)
+             recipients = [agent participant]
+             content    = { type: "TEXT", text: "[áudio transcrito] <text>"
+                                                  or "[imagem recebida] <text>" }
+           ↓
+        6. CO fires COMMUNICATION_CREATED → TAC.onMessageReady → agent processes
+        7. CI operators (if configured) extract observations from the text
+```
+
+### Where each Twilio resource fits
+
+| Resource | Role | Where configured |
+|---|---|---|
+| **WhatsApp Sender** | Receives the inbound audio. Webhook fires per message regardless of CO. | Console → Messaging → Senders → WhatsApp → "Webhook URL for incoming messages" |
+| **Conversation Orchestrator (Maestro)** | Groups conversations, manages participants, fires `COMMUNICATION_CREATED` on the inserted message, hosts CI operators. **Not** involved in transcription or media handling. | Console → Conversation Orchestrator → Configurations |
+| **Twilio Media API** | Hosts the media file behind `MediaUrl0` for ~one hour after delivery. | Auto, no setup |
+| **OpenAI Whisper** | Transcribes the audio buffer to text. | `OPENAI_API_KEY` env var; model via `WHISPER_MODEL`; language via `WHISPER_LANGUAGE` |
+| **OpenAI vision (GPT-4o-mini default)** | Describes the image as plain text. Prompt is customizable per deployment. | `OPENAI_API_KEY`; model via `VISION_MODEL`; prompt via `IMAGE_DESCRIPTION_PROMPT` |
+| **Memora** | Receives observations once CI operators run on the inserted text. | Linked to the conv config's `memoryStoreId` |
+
+### Setup steps
+
+1. **Enable the feature in env**:
+   ```bash
+   INBOUND_MEDIA_ENABLED=true
+   # optional overrides:
+   INBOUND_MEDIA_ROUTE_PATH=/inbound-message   # default
+   WHISPER_MODEL=whisper-1                     # audio model, default
+   WHISPER_LANGUAGE=pt                         # audio language hint, default
+   VISION_MODEL=gpt-4o-mini                    # image model, default
+   IMAGE_DESCRIPTION_PROMPT=<your prompt>      # tailor to your domain (pharma, retail, etc.)
+   ```
+   `OPENAI_API_KEY` is already required by the LLM providers — Whisper + vision reuse it.
+   One flag turns both audio and image handling on — they share the cost and the route.
+
+2. **Point your WhatsApp Sender's webhook URL at the route**:
+   - Console → Messaging → Senders → WhatsApp → click your sender (e.g., `whatsapp:+551132304091`)
+   - Set "Webhook URL for incoming messages" to `https://<your-host><INBOUND_MEDIA_ROUTE_PATH>` (e.g. `https://goliveira.ngrok.app/inbound-message`)
+   - Method: `POST`
+   - Save
+
+3. **Start the app** — at boot you should see:
+   ```
+   [InboundMedia] route registered at /inbound-message
+   ```
+
+4. **Test**: open WhatsApp on the customer's phone, send any text first to establish an active CO conversation, then send a voice note. In logs you'll see:
+   ```
+   [InboundMedia] transcribed audio (N chars), inserting into conv_conversation_...
+   [InboundMedia] insert OK — actionId=conv_communication_... messageSid=IM...
+   ```
+   And the agent should reply to the transcription in the customer's WhatsApp.
+
+### What's NOT going through Maestro
+
+- The audio file itself — never enters CO. Lives only in Twilio Media (transient) and Whisper's API (transient).
+- The transcription step — pure application + OpenAI. CO has no visibility until step 5.
+- Signature validation — uses TAC's auth token, no CO involvement.
+
+What IS through Maestro: only the final `POST /v2/Conversations/{id}/Communications`. That's the boundary where application content re-enters the platform and becomes visible to CO/CI/Memora.
+
+### Limitations & extension points
+
+- **First message must be text**. Maestro won't create a conversation for audio-only inbound. If the customer's very first WhatsApp message is a voice note, `findActiveConversation` returns null and the transcription is skipped with a warning. Customer needs to text first.
+- **Audio and image only for now**. The dispatch in [src/messaging/inboundMediaWebhook.ts](src/messaging/inboundMediaWebhook.ts) branches on `audio/*` (Whisper) and `image/*` (vision). PDF (OCR), video (frame extraction), and vCard are natural extensions — same shape, different model.
+- **OpenAI costs apply per media item** — Whisper per audio second, vision per token. Set `INBOUND_MEDIA_ENABLED=false` to opt out entirely.
+
+### Why a REST endpoint, not the Action API
+
+The matching endpoint `POST /v2/Conversations/{id}/Actions` with `INSERT_COMMUNICATION` looks tempting and is documented, but it silently requires the participant's address to carry a `CH...` channelId binding — which only exists when a Conversations v1 bridge is active on the WhatsApp Sender. The REST endpoint `POST /v2/Conversations/{id}/Communications` has no such requirement and works in pure-Maestro deployments. Worth knowing if anyone tries to "simplify" the helper by switching to the Action API.
+
 ## Enterprise Knowledge
 
 The template integrates with **Twilio Enterprise Knowledge** (Memora) — a managed RAG service that stores, chunks, and semantically searches your content. Each domain (FAQ, billing, driver service) gets its own Knowledge Base and a dedicated search tool, so the LLM can pick the right source based on the question.
@@ -374,6 +473,12 @@ src/
 
 ## Design Decisions
 
+> The sections below cover individual design choices. For the consolidated
+> playbook on what to do (and why) to make a TAC agent feel human across
+> all the surfaces — TTS stuttering, message debouncing, typing indicators,
+> interrupt context, channel-adaptive output, inbound media — see
+> **[HUMANIZING_AGENTS.md](HUMANIZING_AGENTS.md)**.
+
 ### Why TAC over the original template?
 
 1. **No Redis dependency** — TAC manages sessions in-memory, Memora handles persistence
@@ -395,10 +500,81 @@ Maestro still runs passively in v1 mode, so CI and memory work regardless.
 
 Profile traits (customer name) are needed for the Flex task `name` attribute. Rather than caching trait data in memory and risking staleness, the handoff calls `tac.fetchProfile()` at the moment of handoff — ensuring the latest data from Memora.
 
+### Why debounce messaging turns?
+
+Default flow is 1:1 — every inbound `onMessageReady` triggers an LLM call and a reply. That breaks down when a customer types `"oi"` and immediately follows with `"preciso de ajuda"`: the agent generates a half-formed greeting before the second message even arrives, then a second turn for the follow-up. Confusing for the customer, two API calls for what's logically one turn.
+
+The template applies a per-conversation debounce window for **messaging channels** (`MESSAGE_DEBOUNCE_MS`, default 2000ms). Inbound messages buffer until the window goes quiet, then run as a single LLM turn with combined text. Voice channels are never debounced (ConversationRelay's WebSocket handles natural turn-taking and added latency would be audible).
+
+The debounce also coordinates with in-flight LLM calls: if a new message arrives mid-turn, it's appended to the buffer and a fresh debounce kicks in once the current turn completes. Avoids overlapping responses.
+
+A typing indicator (WhatsApp only — Twilio's typing-indicator API is messaging-channel-specific) fires immediately on every inbound message, before the buffer/debounce logic. Customers see "typing…" within ~50ms of sending, refreshed on every additional message — natural discouragement against piling up more messages while the agent works.
+
+### Why a side-channel for inbound media (audio, eventually images)?
+
+Conversation Orchestrator's docs spell this out: "Communications support text and template messages. Media attachments on inbound or outbound WhatsApp messages aren't added to the conversation." Same for RCS. So an audio voice note from a WhatsApp customer never enters CO — neither the media URL nor any transcription. Memora has nothing to extract observations from. CI operators run on nothing.
+
+The template solves this by registering a **second webhook** that bypasses CO and consumes the underlying Programmable Messaging webhook directly. Wired by setting `INBOUND_MEDIA_ENABLED=true`:
+
+1. WhatsApp inbound media → Programmable Messaging webhook fires `POST /inbound-message`
+2. Template validates `X-Twilio-Signature` against TAC's auth token
+3. Audio media: downloads, transcribes via Whisper (`WHISPER_MODEL`, `WHISPER_LANGUAGE`)
+4. Looks up the active CO conversation for the customer/agent address pair
+5. Calls `insertCommunication` with `[áudio transcrito] <text>` — the inserted message fires `COMMUNICATION_CREATED` → TAC's `onMessageReady` → the agent processes it as a normal customer turn → CI operators run on the transcription
+
+Result: from CO's, Memora's, CI's, and the LLM's perspective, the audio "is" a customer message. The application boundary owns transcription; the platform owns insight extraction. That's the pitch.
+
+Off by default — costs nothing to demos that don't need it. Adding image-description, document OCR, etc. follows the same pattern: extend the dispatch in `src/messaging/inboundMediaWebhook.ts` to handle the appropriate `MediaContentType*`.
+
+### Why expose `insertCommunication`?
+
+Maestro's `SEND_MESSAGE` Actions API only emits messages *from* the agent. There's no built-in way to **inject application-side content as a customer message** — useful for surfacing audio transcriptions, OCR'd images, or any content your app produces on behalf of the customer back into the conversation.
+
+Twilio's Conversation Orchestrator does support this via a separate Actions API type:
+
+```
+POST /v2/Conversations/{id}/Actions
+{ "type": "INSERT_COMMUNICATION", "payload": { "from": ..., "to": ..., "content": ... } }
+```
+
+But TAC 1.0.0's `ConversationClient` doesn't expose it. The template adds [src/messaging/insertCommunication.ts](src/messaging/insertCommunication.ts) — a thin helper that POSTs the action using the credentials from `tac.getConfig()`.
+
+Importable as:
+
+```ts
+import { insertCommunication } from 'conversation-relay-tac/messaging';
+
+await insertCommunication(tac, {
+  conversationId,
+  from: { channel: 'WHATSAPP', participantId: customerParticipantId },
+  to:   [{ channel: 'WHATSAPP', participantId: agentParticipantId }],
+  text: '<the transcription / OCR / etc.>',
+});
+```
+
+The inserted communication:
+
+- Is attributed to the customer participant in conversation history.
+- Fires `COMMUNICATION_CREATED` → TAC's `onMessageReady` → the agent processes it as a normal turn.
+- Is visible to **Conversation Intelligence** — operators run on the text just like any other message, so audio transcriptions surface as observations and summaries in Memora.
+
+Channels supported: `WHATSAPP`, `SMS`, `CHAT`, `RCS`. Voice transcripts arrive natively via ConversationRelay, so this isn't needed for voice. Strong upstream PR candidate for TAC's `ConversationClient`.
+
+### Why buffer LLM streams to word boundaries on voice?
+
+OpenAI's streaming APIs (and Anthropic's, and most LLM providers) emit deltas as sub-word fragments — often 1-3 characters at a time. Forwarding each delta verbatim to ConversationRelay's TTS produces two distinct problems:
+
+1. **Stuttering at chunk boundaries.** TTS engines have to coalesce sub-word tokens on the fly; at chunk boundaries the audio can repeat or drop tokens.
+2. **Mispronunciation of digraphs in non-English languages.** TTS applies grapheme-to-phoneme rules per chunk. When `manhã` arrives as `man` + `hã`, the engine has already committed to a /n/ for the `n` before the `h` arrives — so you get /man.ha/ instead of the correct /ma.ɲɐ̃/. Same issue applies to Portuguese `nh`/`lh`/`ch`/`rr`, Spanish `ll`/`rr`, French `gn`/`ch`, English `th`/`sh`/`ph`, etc.
+
+The fix lives in [src/providers/streamBuffer.ts](src/providers/streamBuffer.ts): a `bufferAtWordBoundaries` async-generator wrapper that holds the partial trailing word until whitespace arrives, then yields whole words. Applied once at the voice call site in [app.ts](src/app.ts) so any provider — OpenAI Responses, OpenAI Chat Completions, OpenAI Agents SDK, Anthropic, local LLMs — benefits without per-provider code. Messaging channels skip the wrapper entirely (they call `generateResponse`, not `sendStreamingResponse`), so markdown/emoji output is unaffected.
+
+Cost: one delta of latency. Benefit: dramatically smoother TTS, plus correct pronunciation for any non-English voice deployment.
+
 ## Known limitations
 
 - **WhatsApp Business Calling — first 1-2s of greeting may clip.** Meta's WhatsApp calling API takes a moment to establish the audio path after SIP connects. Working around this requires a custom `<Pause>` injected before `<Connect>` in the TwiML; not currently available OOTB.
-- **Memory retrieval is opt-in.** TAC 1.0.0 defaults channel `memoryMode` to `'never'` so customers aren't billed for Memory API calls they didn't ask for. The template opts in (`new VoiceChannel(tac, { memoryMode: 'always' })`) so the LLM receives memory context on every turn. Tradeoff: ~500ms-2s of Memory API latency + per-call billing per inbound message. There's no "once per conversation" mode upstream yet (filed as an upstream PR candidate).
+- **Memory retrieval mode** is controlled by `MEMORY_RECALL_MODE` (default `always`). TAC 1.0.0 itself only ships `'always' | 'never'` so customers aren't billed for Memory API calls they didn't ask for. The template adds a third option, `'first-prompt'`, that recalls memory once per conversation and reuses the cached response on subsequent turns — same context for the LLM, dramatically lower Memory API cost on long conversations. Tradeoff: observations/summaries added mid-conversation (e.g., by Conversation Intelligence) won't appear until the next conversation. Filed upstream as a TAC PR candidate.
 - **Maestro handoff is no-op.** `tac.triggerHandoff()` was removed in `twilio-agent-connect@1.0.0` in favor of the tool-based pattern. To enable LLM-driven handoff in Maestro mode, add `createStudioHandoffTool(tac, session)` to your tools list.
 - **Deepgram-specific ConversationRelay attrs unavailable.** `deepgramSmartFormat` and `speechTimeout` are not in TAC 1.0.0's schema, and `reportInputDuringAgentSpeech` is boolean-only (the TwiML spec also accepts `'any' | 'speech' | 'none'`). File an upstream PR or use `patch-package` if you need them.
 

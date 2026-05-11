@@ -10,7 +10,8 @@
     "./tools": "./dist/tools/index.js",
     "./providers/*": "./dist/providers/*.js",
     "./prompts/*": "./dist/prompts/*.js",
-    "./channels/*": "./dist/channels/*.js"
+    "./channels/*": "./dist/channels/*.js",
+    "./messaging": "./dist/messaging/index.js"
   },
   "scripts": {
     "start": "node dist/index.js",

@@ -15,6 +15,7 @@
  *   });
  */
 
+import { createHash } from 'crypto';
 import {
   TAC,
   TACConfig,
@@ -32,6 +33,8 @@ import type { TACTool } from 'twilio-agent-connect';
 
 import { config } from './config.js';
 import { createLLMProvider } from './providers/factory.js';
+import { bufferAtWordBoundaries } from './providers/streamBuffer.js';
+import { registerInboundMediaWebhook } from './messaging/inboundMediaWebhook.js';
 import { getAdditionalContext } from './prompts/additionalContext.js';
 import { languageOptions, type LanguageOption } from './languageOptions.js';
 import type { LLMProvider } from './providers/types.js';
@@ -88,9 +91,16 @@ export async function createApp(options: AppOptions): Promise<void> {
   const isMaestroMode = config.messagingMode === 'maestro';
 
   const tac = await TAC.create({ config: TACConfig.fromEnv() });
-  // memoryMode defaults to 'never' in TAC 1.0.0+. Opt in to per-message memory
-  // retrieval so onMessageReady callbacks receive a populated `memory` argument.
-  const voiceChannel = new VoiceChannel(tac, { memoryMode: 'always' });
+
+  // Memory recall mode (set per-channel below). TAC ships only 'always' | 'never';
+  // we extend with 'first-prompt' (recall once per conversation, app-level cache).
+  // For 'first-prompt' we tell TAC to NEVER auto-recall, then handle retrieval
+  // ourselves on the first message of each conversation.
+  const tacMemoryMode: 'always' | 'never' =
+    config.memoryRecallMode === 'always' ? 'always' : 'never';
+  console.log(`[Memory] Recall mode: ${config.memoryRecallMode} (TAC channel memoryMode=${tacMemoryMode})`);
+
+  const voiceChannel = new VoiceChannel(tac, { memoryMode: tacMemoryMode });
   tac.registerChannel(voiceChannel);
 
   // Build final tools list — static + dynamic (e.g. knowledge tools that need tac).
@@ -107,8 +117,8 @@ export async function createApp(options: AppOptions): Promise<void> {
   let whatsappChannel: WhatsAppChannel | undefined;
 
   if (isMaestroMode) {
-    smsChannel = new SMSChannel(tac, { memoryMode: 'always' });
-    whatsappChannel = new WhatsAppChannel(tac, { memoryMode: 'always' });
+    smsChannel = new SMSChannel(tac, { memoryMode: tacMemoryMode });
+    whatsappChannel = new WhatsAppChannel(tac, { memoryMode: tacMemoryMode });
     tac.registerChannel(smsChannel);
     tac.registerChannel(whatsappChannel);
   }
@@ -120,6 +130,21 @@ export async function createApp(options: AppOptions): Promise<void> {
   // change so the agent adapts style when the customer moves between voice
   // and messaging mid-conversation (GROUP_BY_PROFILE keeps the same convId).
   const lastChannelByConversation = new Map<string, string>();
+  // Cache for memoryRecallMode='first-prompt': memory retrieved once on
+  // conversation's first message and reused for subsequent turns.
+  const memoryByConversation = new Map<string, TACMemoryResponse>();
+  // Per-conversation message-debouncer state. Buffers rapid-fire messages
+  // ("oi" + "preciso de ajuda" 300ms apart → one combined LLM turn) and
+  // serializes turns when new messages arrive while a turn is in flight.
+  // Voice is never debounced.
+  type MessageReadyParams = Parameters<Parameters<typeof tac.onMessageReady>[0]>[0];
+  type DebounceState = {
+    buffer: string[];
+    timer: ReturnType<typeof setTimeout> | null;
+    inFlight: boolean;
+    lastParams: MessageReadyParams;
+  };
+  const debounceStates = new Map<string, DebounceState>();
 
   async function getProvider(conversationId: ConversationId): Promise<LLMProvider> {
     const key = conversationId as string;
@@ -234,7 +259,68 @@ export async function createApp(options: AppOptions): Promise<void> {
 
   // ─── Message Handler ────────────────────────────────────────────────────────
 
-  tac.onMessageReady(async ({ conversationId, message, memory, session, channel }) => {
+  // Thin entry: typing indicator first (visible to customer fast), then voice
+  // bypasses debouncing while messaging buffers and serializes turns.
+  tac.onMessageReady(async (params) => {
+    const { conversationId, channel, session } = params;
+
+    // Fire typing indicator immediately on every messaging arrival. Re-firing
+    // refreshes WhatsApp's ~25s sticky window, so customers see "typing..." the
+    // entire way through a debounced burst + LLM call.
+    if (channel === 'whatsapp' && session.authorInfo?.address?.startsWith('whatsapp:')) {
+      sendWhatsAppTypingIndicator(session.authorInfo.address);
+    }
+
+    // Voice path: no debounce. ConversationRelay's WebSocket handles natural
+    // turn-taking and any added latency would be audible.
+    if (channel === 'voice') {
+      return processMessageTurn(params.message, params);
+    }
+
+    // Conversations v1 path doesn't go through onMessageReady's LLM branch
+    // either (it's handled by registerConversationsV1Routes); short-circuit.
+    if (!isMaestroMode) {
+      return processMessageTurn(params.message, params);
+    }
+
+    // Maestro messaging: buffer + debounce. If a turn is already in flight,
+    // append to the buffer and let fireDebounce reschedule once it completes.
+    const convKey = conversationId as string;
+    let state = debounceStates.get(convKey);
+    if (!state) {
+      state = { buffer: [], timer: null, inFlight: false, lastParams: params };
+      debounceStates.set(convKey, state);
+    }
+    state.buffer.push(params.message);
+    state.lastParams = params;
+    if (!state.inFlight) {
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = setTimeout(() => fireDebounce(convKey), config.messageDebounceMs);
+    }
+  });
+
+  async function fireDebounce(convKey: string): Promise<void> {
+    const state = debounceStates.get(convKey);
+    if (!state || state.inFlight || state.buffer.length === 0) return;
+    const combined = state.buffer.join('\n');
+    state.buffer = [];
+    state.timer = null;
+    state.inFlight = true;
+    try {
+      await processMessageTurn(combined, state.lastParams);
+    } catch (err) {
+      console.error(`[Debounce] processMessageTurn failed for ${convKey}:`, err);
+    } finally {
+      state.inFlight = false;
+      // If new messages arrived during processing, reschedule.
+      if (state.buffer.length > 0) {
+        state.timer = setTimeout(() => fireDebounce(convKey), config.messageDebounceMs);
+      }
+    }
+  }
+
+  async function processMessageTurn(message: string, params: MessageReadyParams): Promise<void> {
+    const { conversationId, memory, session, channel } = params;
     console.log(`[TAC] Message from ${channel}: "${message.substring(0, 80)}..."`);
     console.log('[TAC] Inbound session: profileId=%s | hasProfile=%s | memoryProvided=%s',
       session.profileId ?? 'none',
@@ -243,11 +329,30 @@ export async function createApp(options: AppOptions): Promise<void> {
     );
 
     const provider = await getProvider(conversationId);
+    const convKey = conversationId as string;
+
+    // first-prompt mode: TAC won't auto-recall (we set memoryMode='never' for
+    // it), so retrieve once here and cache for the rest of the conversation.
+    let effectiveMemory = memory;
+    if (config.memoryRecallMode === 'first-prompt') {
+      let cached = memoryByConversation.get(convKey);
+      if (!cached) {
+        try {
+          cached = await tac.retrieveMemory(session, message);
+          memoryByConversation.set(convKey, cached);
+          console.log('[Memory] Recalled (first-prompt) and cached for conversation');
+        } catch (err) {
+          console.warn('[Memory] retrieveMemory failed in first-prompt mode:', err);
+        }
+      } else {
+        console.log('[Memory] Reusing cached recall (first-prompt)');
+      }
+      effectiveMemory = cached;
+    }
 
     // Inject the current channel so the LLM can adapt its style. Only
     // re-inject when the channel changes (first turn, or cross-channel
     // transition like WhatsApp → voice on the same conversation).
-    const convKey = conversationId as string;
     if (lastChannelByConversation.get(convKey) !== channel) {
       lastChannelByConversation.set(convKey, channel);
       provider.addSystemContext(`Current communication channel: ${channel}`);
@@ -300,19 +405,15 @@ export async function createApp(options: AppOptions): Promise<void> {
 
     // Inject context (profile traits + memory if any). injectMemoryContext
     // handles undefined memory gracefully — profile traits alone still go through.
-    injectMemoryContext(provider, memory, session);
+    injectMemoryContext(provider, effectiveMemory, session);
 
-    // Inject customer phone for messaging channels
+    // Inject customer phone for messaging channels.
+    // Typing indicator already fired in the onMessageReady entry — no re-fire here.
+    // TAC 1.0.0 auto-reconciles the AI agent participant on inbound webhooks
+    // via MessagingChannel.reconcileParticipants — no manual addParticipant needed.
     if (channel !== 'voice' && session.authorInfo?.address) {
       const customerPhone = session.authorInfo.address.replace(/^whatsapp:/i, '');
-
-      // Send typing indicator for WhatsApp (fire-and-forget)
-      if (channel === 'whatsapp' && session.authorInfo.address.startsWith('whatsapp:')) {
-        sendWhatsAppTypingIndicator(session.authorInfo.address);
-      }
       provider.addSystemContext(`Customer phone: ${customerPhone}`);
-      // TAC 1.0.0 auto-reconciles the AI agent participant on inbound webhooks
-      // via MessagingChannel.reconcileParticipants — no manual addParticipant needed.
     }
 
     // Per-session tools: handoff tool needs session in closure. Built fresh per
@@ -329,9 +430,14 @@ export async function createApp(options: AppOptions): Promise<void> {
       const streamController = voiceChannel.startStreamTask(conversationId);
 
       try {
+        // Buffer the LLM stream to word boundaries before handing it to
+        // ConversationRelay. Avoids TTS stuttering on sub-word delta chunks.
+        // Provider-agnostic — works for any AsyncIterable<string> source.
         await voiceChannel.sendStreamingResponse(
           conversationId,
-          provider.streamResponse(message, callTools, streamController.controller.signal),
+          bufferAtWordBoundaries(
+            provider.streamResponse(message, callTools, streamController.controller.signal)
+          ),
           { signal: streamController.controller.signal }
         );
       } catch (err) {
@@ -365,7 +471,7 @@ export async function createApp(options: AppOptions): Promise<void> {
         console.error(`[${channel.toUpperCase()}] Error for ${conversationId}:`, err);
       }
     }
-  });
+  } // end processMessageTurn
 
   // ─── Voice Interrupt Handler ────────────────────────────────────────────────
 
@@ -389,6 +495,10 @@ export async function createApp(options: AppOptions): Promise<void> {
     const key = session.conversationId as string;
     providers.delete(key);
     lastChannelByConversation.delete(key);
+    memoryByConversation.delete(key);
+    const debounce = debounceStates.get(key);
+    if (debounce?.timer) clearTimeout(debounce.timer);
+    debounceStates.delete(key);
     console.log(`[TAC] Conversation ended: ${session.conversationId}`);
   });
 
@@ -436,6 +546,22 @@ export async function createApp(options: AppOptions): Promise<void> {
     },
   });
 
+  // Diagnostic hook: log every inbound /webhook POST with its idempotency
+  // token and a hash of the body. Use this to spot Twilio webhook retries
+  // delivered with no/different idempotency tokens (TAC's dedup misses
+  // those, leading to double LLM invocation).
+  server.fastify.addHook('preHandler', async (req) => {
+    if (req.method !== 'POST' || !req.url.startsWith('/webhook')) return;
+    const idem = req.headers['i-twilio-idempotency-token'] ?? '(absent)';
+    const sig = req.headers['x-twilio-signature'] ? 'present' : 'absent';
+    const bodyStr = typeof req.body === 'string' ? req.body : JSON.stringify(req.body ?? {});
+    const bodyHash = createHash('sha256').update(bodyStr).digest('hex').slice(0, 12);
+    const eventType = (req.body as { type?: string } | undefined)?.type ?? '?';
+    console.log(
+      `[Webhook] reqId=${req.id} url=${req.url.split('?')[0]} type=${eventType} idem=${idem} sig=${sig} bodyHash=${bodyHash}`
+    );
+  });
+
   if (!isMaestroMode) {
     registerConversationsV1Routes(server.fastify, {
       tac,
@@ -445,6 +571,12 @@ export async function createApp(options: AppOptions): Promise<void> {
       injectMemoryContext,
     });
   }
+
+  // Inbound media (Programmable Messaging webhook): registers the
+  // /inbound-message route only when INBOUND_MEDIA_ENABLED=true and
+  // OPENAI_API_KEY is set. Demos that don't need audio transcription
+  // pay nothing for this code path.
+  registerInboundMediaWebhook(server, tac);
 
   server
     .start()
