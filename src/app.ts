@@ -56,6 +56,20 @@ export interface AppOptions {
    */
   buildDynamicTools?: (tac: TAC) => TACTool[];
 
+  /**
+   * Optional per-message factory for tools that need access to the live
+   * `ConversationSession`. Called inside processMessageTurn on every turn,
+   * just before the tool list is handed to the LLM provider.
+   *
+   * Returned tools are appended to the per-call tool list. If a returned
+   * tool's `name` matches a tool already in the list (including the OOTB
+   * `liveAgentHandoff` that the template auto-wires in Maestro mode), the
+   * session tool *replaces* it. Use this to ship a domain-specific handoff
+   * tool that bakes session-derived attributes (e.g., current order number)
+   * into the Studio Flow payload.
+   */
+  buildSessionTools?: (tac: TAC, session: ConversationSession) => TACTool[];
+
   /** Dynamic context injected on each message (e.g., current date/time). Defaults to date/time. */
   additionalContext?: () => string;
 
@@ -84,6 +98,7 @@ export async function createApp(options: AppOptions): Promise<void> {
     defaultLanguage = languageOptions.portuguese,
     welcomeGreeting = config.welcomeGreeting,
     conversationRelayConfig: extraRelayConfig = {},
+    buildSessionTools,
   } = options;
 
   // ─── Initialize TAC ────────────────────────────────────────────────────────
@@ -102,6 +117,38 @@ export async function createApp(options: AppOptions): Promise<void> {
 
   const voiceChannel = new VoiceChannel(tac, { memoryMode: tacMemoryMode });
   tac.registerChannel(voiceChannel);
+
+  // Pre-setup memory recall (voice + 'first-prompt' mode only).
+  // ConversationRelay's `setup` message fires the moment the call connects,
+  // before the welcome greeting plays — we use that window to start the
+  // memory recall in parallel. By the time the customer finishes speaking
+  // their first utterance, the recall is usually done and the first turn
+  // latency drops by the recall round-trip time.
+  if (config.memoryRecallMode === 'first-prompt') {
+    const memoryClient = tac.getMemoryClient();
+    voiceChannel.on('setup', ({ from, callSid }: { from: string; callSid: string }) => {
+      if (!memoryClient || !from) return;
+      const phone = from.replace(/^whatsapp:/i, '');
+      const startedAt = Date.now();
+      const promise: Promise<TACMemoryResponse | null> = (async () => {
+        try {
+          const lookup = await memoryClient.lookupProfile('phone', phone);
+          const profileId = lookup.profiles[0];
+          if (!profileId) {
+            console.log(`[Memory] Pre-fetch (voice setup, callSid=${callSid}, ${phone}): no profile (${Date.now() - startedAt}ms)`);
+            return new TACMemoryResponse([]);
+          }
+          const data = await memoryClient.retrieveMemories(profileId);
+          console.log(`[Memory] Pre-fetch (voice setup, callSid=${callSid}, profile=${profileId}) done in ${Date.now() - startedAt}ms`);
+          return new TACMemoryResponse(data);
+        } catch (err) {
+          console.warn(`[Memory] Pre-fetch failed for callSid=${callSid}:`, err);
+          return null;
+        }
+      })();
+      prefetchByPhone.set(phone, promise);
+    });
+  }
 
   // Build final tools list — static + dynamic (e.g. knowledge tools that need tac).
   // In Maestro mode, the OOTB createStudioHandoffTool replaces the legacy
@@ -133,6 +180,14 @@ export async function createApp(options: AppOptions): Promise<void> {
   // Cache for memoryRecallMode='first-prompt': memory retrieved once on
   // conversation's first message and reused for subsequent turns.
   const memoryByConversation = new Map<string, TACMemoryResponse>();
+  // Voice-only optimization: under 'first-prompt' mode, kick off recall the
+  // moment ConversationRelay sends the `setup` message (call connected,
+  // welcome greeting starts playing). By the time the customer speaks, the
+  // recall is usually done — first response is faster by the duration of the
+  // recall round-trip (typically 400–1000 ms). Keyed by caller phone since
+  // the conversationId/session doesn't exist yet at setup time (CO creates
+  // them on the first transcription event).
+  const prefetchByPhone = new Map<string, Promise<TACMemoryResponse | null>>();
   // Per-conversation message-debouncer state. Buffers rapid-fire messages
   // ("oi" + "preciso de ajuda" 300ms apart → one combined LLM turn) and
   // serializes turns when new messages arrive while a turn is in flight.
@@ -146,13 +201,38 @@ export async function createApp(options: AppOptions): Promise<void> {
   };
   const debounceStates = new Map<string, DebounceState>();
 
+  // Diagnostic helper for VOICE_STREAM_DEBUG. Wraps any AsyncIterable<string>
+  // and prints each chunk with a label so we can compare what the provider
+  // emitted vs. what we hand to ConversationRelay. Used at the call site to
+  // distinguish pipeline-side duplication from TTS-side artifacts.
+  async function* tapStream(
+    source: AsyncIterable<string>,
+    label: string,
+    convId: ConversationId,
+  ): AsyncIterable<string> {
+    let n = 0;
+    for await (const chunk of source) {
+      n++;
+      console.log(`[VoiceStream:${label}] ${convId} #${n} (${chunk.length}c): ${JSON.stringify(chunk)}`);
+      yield chunk;
+    }
+    console.log(`[VoiceStream:${label}] ${convId} END (${n} chunks)`);
+  }
+
   async function getProvider(conversationId: ConversationId): Promise<LLMProvider> {
     const key = conversationId as string;
     let provider = providers.get(key);
     if (!provider) {
-      provider = await createLLMProvider();
-      // Inject system prompt and additional context on first creation
-      provider.addSystemContext(systemPrompt);
+      // Pass conversationId so session-scoped providers (e.g. Langflow) can
+      // use it as their session identifier. Other providers ignore it.
+      provider = await createLLMProvider(key);
+      // Langflow's Agent component owns the system prompt inside the flow,
+      // so injecting TAC's systemPrompt would compete with it (it lands in
+      // the user message as [Context], not as a system role). Dynamic
+      // per-turn context like the date still goes through.
+      if (config.llm.provider !== 'langflow') {
+        provider.addSystemContext(systemPrompt);
+      }
       provider.addSystemContext(additionalContext());
       providers.set(key, provider);
     }
@@ -167,9 +247,17 @@ export async function createApp(options: AppOptions): Promise<void> {
       try {
         await new Promise(resolve => setTimeout(resolve, 1000));
 
-        const authHeader =
-          'Basic ' +
-          Buffer.from(`${tacConfig.accountSid}:${tacConfig.authToken}`).toString('base64');
+        // Use API Key/Secret rather than Auth Token — API Keys are the
+        // recommended credential for REST calls and match what the rest of
+        // TAC uses, so we don't depend on TWILIO_AUTH_TOKEN being set/fresh.
+        const credUser = tacConfig.apiKey;
+        const credPass = tacConfig.apiSecret;
+        const acctSid = tacConfig.accountSid;
+        const sha = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, 12);
+        console.log(
+          `[Typing] auth user=${credUser?.slice(0, 4) ?? 'MISSING'}...${credUser?.slice(-4) ?? ''} (len=${credUser?.length ?? 0} sha=${credUser ? sha(credUser) : 'n/a'}) pass_len=${credPass?.length ?? 0} pass_sha=${credPass ? sha(credPass) : 'n/a'} acct=${acctSid?.slice(0, 6) ?? 'MISSING'}...`,
+        );
+        const authHeader = 'Basic ' + Buffer.from(`${credUser}:${credPass}`).toString('base64');
 
         const listUrl = new URL(
           `https://api.twilio.com/2010-04-01/Accounts/${tacConfig.accountSid}/Messages.json`
@@ -180,12 +268,18 @@ export async function createApp(options: AppOptions): Promise<void> {
         const listResponse = await fetch(listUrl.toString(), {
           headers: { Authorization: authHeader },
         });
-        if (!listResponse.ok) return;
+        if (!listResponse.ok) {
+          console.warn(`[Typing] list messages failed (${listResponse.status}): ${await listResponse.text()}`);
+          return;
+        }
 
         const listData = (await listResponse.json()) as { messages?: { sid: string }[] };
-        if (!listData.messages || listData.messages.length === 0) return;
+        if (!listData.messages || listData.messages.length === 0) {
+          console.warn(`[Typing] no recent inbound message found for ${customerPhone}`);
+          return;
+        }
 
-        await fetch('https://messaging.twilio.com/v2/Indicators/Typing.json', {
+        const typingResponse = await fetch('https://messaging.twilio.com/v2/Indicators/Typing.json', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
@@ -196,8 +290,13 @@ export async function createApp(options: AppOptions): Promise<void> {
             channel: 'whatsapp',
           }).toString(),
         });
-      } catch {
-        // Fire-and-forget
+        if (!typingResponse.ok) {
+          console.warn(`[Typing] indicator POST failed (${typingResponse.status}): ${await typingResponse.text()}`);
+        } else {
+          console.log(`[Typing] indicator sent for ${customerPhone} (msg ${listData.messages[0]!.sid})`);
+        }
+      } catch (err) {
+        console.error('[Typing] unexpected error:', err);
       }
     })();
   }
@@ -333,14 +432,31 @@ export async function createApp(options: AppOptions): Promise<void> {
 
     // first-prompt mode: TAC won't auto-recall (we set memoryMode='never' for
     // it), so retrieve once here and cache for the rest of the conversation.
+    // For voice, a pre-fetch was already kicked off on the `setup` event —
+    // we just await it here (usually already resolved by the time the
+    // customer's first utterance lands).
     let effectiveMemory = memory;
     if (config.memoryRecallMode === 'first-prompt') {
       let cached = memoryByConversation.get(convKey);
       if (!cached) {
+        const phone = session.authorInfo?.address?.replace(/^whatsapp:/i, '');
+        const prefetched = channel === 'voice' && phone ? prefetchByPhone.get(phone) : undefined;
         try {
-          cached = await tac.retrieveMemory(session, message);
-          memoryByConversation.set(convKey, cached);
-          console.log('[Memory] Recalled (first-prompt) and cached for conversation');
+          if (prefetched) {
+            const awaitStart = Date.now();
+            const result = await prefetched;
+            prefetchByPhone.delete(phone!);
+            if (result) {
+              cached = result;
+              memoryByConversation.set(convKey, cached);
+              console.log(`[Memory] Recalled (first-prompt via voice pre-fetch) — await took ${Date.now() - awaitStart}ms (0ms means already resolved)`);
+            }
+          }
+          if (!cached) {
+            cached = await tac.retrieveMemory(session, message);
+            memoryByConversation.set(convKey, cached);
+            console.log('[Memory] Recalled (first-prompt) and cached for conversation');
+          }
         } catch (err) {
           console.warn('[Memory] retrieveMemory failed in first-prompt mode:', err);
         }
@@ -353,9 +469,20 @@ export async function createApp(options: AppOptions): Promise<void> {
     // Inject the current channel so the LLM can adapt its style. Only
     // re-inject when the channel changes (first turn, or cross-channel
     // transition like WhatsApp → voice on the same conversation).
+    //
+    // Providers' addSystemContext is append-only — the prior channel line
+    // stays in the prompt. On a switch we explicitly announce supersede so
+    // the model treats the new line as authoritative and ignores the older
+    // one. Without this, a WhatsApp→voice handoff (e.g., tapping a CTA
+    // button) leaves the LLM anchored on the chat framing of the previous
+    // turn ("é só tocar no botão...") even after the voice call lands.
     if (lastChannelByConversation.get(convKey) !== channel) {
+      const prev = lastChannelByConversation.get(convKey);
       lastChannelByConversation.set(convKey, channel);
-      provider.addSystemContext(`Current communication channel: ${channel}`);
+      const line = prev
+        ? `Communication channel switched from "${prev}" to "${channel}". IGNORE any earlier "Current communication channel:" line — only the most recent one is authoritative. Current channel: ${channel}.`
+        : `Current communication channel: ${channel}`;
+      provider.addSystemContext(line);
     }
 
     // Fetch profile traits if we have a profileId but no profile yet
@@ -422,9 +549,21 @@ export async function createApp(options: AppOptions): Promise<void> {
     // and the WebSocket gracefully closes, redirecting the call to Studio.
     // Only added in Maestro mode (the tool throws if Conversation Orchestrator
     // isn't initialized).
-    const callTools: TACTool[] = isMaestroMode
+    let callTools: TACTool[] = isMaestroMode
       ? [...baseTools, createStudioHandoffTool(tac, session, { name: 'liveAgentHandoff' })]
       : baseTools;
+
+    // Session-aware tool overrides: a tool returned by buildSessionTools with
+    // the same name as one already in the list replaces it (so demos can swap
+    // out the OOTB liveAgentHandoff for a domain-specific variant that carries
+    // per-conversation state into Studio Flow attributes).
+    if (buildSessionTools) {
+      const overrides = buildSessionTools(tac, session);
+      if (overrides.length > 0) {
+        const overrideNames = new Set(overrides.map((t) => t.name));
+        callTools = [...callTools.filter((t) => !overrideNames.has(t.name)), ...overrides];
+      }
+    }
 
     if (channel === 'voice') {
       const streamController = voiceChannel.startStreamTask(conversationId);
@@ -433,11 +572,21 @@ export async function createApp(options: AppOptions): Promise<void> {
         // Buffer the LLM stream to word boundaries before handing it to
         // ConversationRelay. Avoids TTS stuttering on sub-word delta chunks.
         // Provider-agnostic — works for any AsyncIterable<string> source.
+        //
+        // VOICE_STREAM_DEBUG=true wraps the raw provider stream and the
+        // post-buffer stream with tap loggers. Use to diagnose TTS hiccups
+        // like duplicated tokens — if a word shows up twice in `raw` but
+        // once in `tts`, the source emitted it twice; if it shows up once
+        // in both but you still hear it twice, the duplication is in
+        // ConversationRelay's TTS, not us. Off by default.
+        const debug = process.env.VOICE_STREAM_DEBUG === 'true';
+        const rawStream = provider.streamResponse(message, callTools, streamController.controller.signal);
+        const tappedRaw = debug ? tapStream(rawStream, 'raw', conversationId) : rawStream;
+        const bufferedStream = bufferAtWordBoundaries(tappedRaw);
+        const tappedBuffered = debug ? tapStream(bufferedStream, 'tts', conversationId) : bufferedStream;
         await voiceChannel.sendStreamingResponse(
           conversationId,
-          bufferAtWordBoundaries(
-            provider.streamResponse(message, callTools, streamController.controller.signal)
-          ),
+          tappedBuffered,
           { signal: streamController.controller.signal }
         );
       } catch (err) {
@@ -468,6 +617,17 @@ export async function createApp(options: AppOptions): Promise<void> {
         await messagingChannel.sendResponse(conversationId, response);
         await handlePostCompletion(provider, conversationId, channel);
       } catch (err) {
+        // Axios errors hide the response body in `data: [Object]` by default,
+        // which obscures the actual Twilio error code/message (e.g.
+        // "Participant ... does not have an address on channel WHATSAPP").
+        // Surface it so failures are diagnosable from the log alone.
+        const responseData = (err as { cause?: { response?: { data?: unknown } } })?.cause?.response?.data;
+        if (responseData) {
+          console.error(
+            `[${channel.toUpperCase()}] Error for ${conversationId} — Twilio response:`,
+            JSON.stringify(responseData),
+          );
+        }
         console.error(`[${channel.toUpperCase()}] Error for ${conversationId}:`, err);
       }
     }
@@ -544,6 +704,19 @@ export async function createApp(options: AppOptions): Promise<void> {
       speechModel: defaultLanguage.speechModel,
       ...extraRelayConfig,
     },
+  });
+
+  // Healthcheck. Liveness only — returns 200 OK if the process is alive and
+  // serving HTTP. Deliberately does NOT probe downstream dependencies
+  // (Twilio, OpenAI, Memora). If those go down we want the container to stay
+  // up and return useful errors, not get restart-looped by the orchestrator.
+  // Adopters who need a separate readiness probe (k8s, etc.) can add a
+  // `/ready` route that does check dependencies.
+  server.fastify.get('/health', async (_req, reply) => {
+    return reply.status(200).send({
+      status: 'ok',
+      uptime: process.uptime(),
+    });
   });
 
   // Diagnostic hook: log every inbound /webhook POST with its idempotency

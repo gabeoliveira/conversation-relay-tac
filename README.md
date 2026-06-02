@@ -107,7 +107,10 @@ cp .env.example .env
 | `KB_FAQ_ID` | Knowledge Base ID for general FAQ | - |
 | `KB_BILLING_ID` | Knowledge Base ID for medical billing | - |
 | `KB_DRIVER_ID` | Knowledge Base ID for driver service | - |
-| `LLM_PROVIDER` | `openai-chat-completions`, `openai-responses`, or `openai-agents` | `openai-chat-completions` |
+| `LLM_PROVIDER` | `openai-chat-completions`, `openai-responses`, `openai-agents`, or `langflow` | `openai-chat-completions` |
+| `LANGFLOW_BASE_URL` | Base URL of the Langflow instance (only when `LLM_PROVIDER=langflow`) | - |
+| `LANGFLOW_FLOW_ID` | ID of the flow to run (only when `LLM_PROVIDER=langflow`) | - |
+| `LANGFLOW_API_KEY` | API key for the Langflow instance (only when `LLM_PROVIDER=langflow`; optional if auth is disabled) | - |
 | `LLM_MODEL` | OpenAI model | `gpt-4.1` |
 | `OPENAI_MAX_COMPLETION_TOKENS` | Max tokens for LLM responses | - |
 | `PORT` | Server port | `3000` |
@@ -404,19 +407,48 @@ Each tool is registered dynamically from env vars (`KB_FAQ_ID`, `KB_BILLING_ID`,
 
 ## LLM Providers
 
-Three OpenAI providers are supported, selectable via `LLM_PROVIDER`:
+Four providers are supported, selectable via `LLM_PROVIDER`:
 
-| Provider | Streaming (Voice) | Non-Streaming (Messaging) | Tool Execution |
-|---|---|---|---|
-| `openai-chat-completions` | Yes (async generator) | Yes | Manual loop |
-| `openai-responses` | Yes (async generator) | Yes | Manual loop |
-| `openai-agents` | Yes (async generator) | Yes | Automatic (agent loop) |
+| Provider | Streaming (Voice) | Non-Streaming (Messaging) | Tool Execution | Notes |
+|---|---|---|---|---|
+| `openai-chat-completions` | Yes (async generator) | Yes | Manual loop | Default. Most predictable. |
+| `openai-responses` | Yes (async generator) | Yes | Manual loop | Uses the Responses API. |
+| `openai-agents` | Yes (async generator) | Yes | Automatic (agent loop) | OpenAI Agents SDK. |
+| `langflow` | Yes (async generator, see below) | Yes | **Flow-owned only** | Visual-flow brain. Tools, knowledge, and prompt live inside the Langflow flow — not in TAC. |
 
-All providers implement the `LLMProvider` interface with:
+All providers implement the same `LLMProvider` interface:
 - `streamResponse()` — returns `AsyncIterable<string>` for voice
 - `generateResponse()` — returns complete string for messaging
-- `addSystemContext()` — injects context (memory, phone number, etc.)
+- `addSystemContext()` — injects context (memory, phone number, channel, etc.)
 - `getLastAction()` / `clearLastAction()` — side-effect tracking (handoff, language switch)
+
+### Using Langflow as the LLM brain
+
+The Langflow provider lets you drive the conversation from a visual flow instead of imperative code. TAC keeps everything else — voice ConversationRelay streaming, messaging channels, memory recall pipeline, debouncing, inbound media side-channel, conversation continuity. The flow is just the brain.
+
+Switching is a config change:
+
+```bash
+LLM_PROVIDER=langflow
+LANGFLOW_BASE_URL=https://your-langflow-host
+LANGFLOW_FLOW_ID=<flow id from Langflow's Publish → API access>
+LANGFLOW_API_KEY=<optional, if auth is enabled>
+```
+
+**What this provider does:**
+
+- Calls `flow.run` (messaging) or `flow.stream` (voice) on every turn, passing the customer message and TAC's `conversationId` as `session_id`.
+- Concatenates everything TAC injects via `addSystemContext` (memory, channel, customer phone, additional context) and **prepends it to the user prompt** under a `[Context] ... [Message] ...` header before sending. Memory recall modes (`always` / `never` / `first-prompt`) all work transparently.
+- Passes voice tokens directly into [`bufferAtWordBoundaries`](src/providers/streamBuffer.ts), so TTS quality matches the OpenAI providers — provided you've enabled streaming on the model component inside the flow.
+
+**Limitations of the first-pass integration** (see [LANGFLOW_PROVIDER_PLAN.md](LANGFLOW_PROVIDER_PLAN.md) for full context):
+
+- **Tools live in the flow.** TAC's `tools` array is ignored. Any tools the LLM needs must be Langflow components. The OOTB `createKnowledgeTools` and `createStudioHandoffTool` that the OpenAI providers wire up are **not** available — implement equivalents in your flow.
+- **Knowledge is a flow concern.** Twilio Knowledge isn't auto-wired. Use a generic HTTP node inside the flow to hit the Knowledge API, or use Langflow's built-in vector store nodes.
+- **No structured-action detection.** `getLastAction()` always returns `undefined` for this provider — handoff / language-switch / end-interaction signals from the flow can't be observed in v1.
+- **Voice streaming setup is on you.** The flow's model component needs streaming turned on (click controls → toggle both Stream switches). Without it, tokens arrive in one batch and voice latency spikes.
+
+If those limitations are blocking, stick with `openai-*` providers — that's the path where TAC owns everything end-to-end.
 
 ## Tools
 
@@ -461,26 +493,37 @@ Tools are defined using TAC's `defineTool()` and executed via a unified `execute
 ## Project Structure
 
 ```
-src/
-+-- index.ts                          # Main entry point — TAC init, handlers, server startup
-+-- config.ts                         # Environment configuration
-+-- languageOptions.ts                # TTS/STT language settings
-+-- channels/
-|   +-- conversations-v1.ts           # Conversations v1 webhook handler + Flex handoff
-+-- providers/
-|   +-- factory.ts                    # LLM provider factory
-|   +-- types.ts                      # LLMProvider interface and ToolAction types
-|   +-- openai-chat-completions.ts    # Chat Completions provider
-|   +-- openai-responses.ts           # Responses API provider
-|   +-- openai-agents.ts              # Agents SDK provider
-+-- prompts/
-|   +-- systemPrompt.ts              # System prompt (persona, guidelines, tool instructions)
-|   +-- additionalContext.ts          # Dynamic context (date/time)
-+-- tools/
-|   +-- index.ts                      # Tool definitions and executeTool()
-|   +-- *.ts                          # Individual tool implementations
-+-- data/
-    +-- mock-data.ts                  # Mock data for tool responses
+.
++-- Dockerfile                        # Two-stage production image (tini PID 1, non-root)
++-- .dockerignore
++-- deploy/                           # Cloud deployment guide + per-provider configs
++-- LANGFLOW_PROVIDER_PLAN.md         # Langflow integration design + limitations
++-- src/
+    +-- app.ts                        # createApp() — webhook/WS wiring, per-conversation state
+    +-- index.ts                      # Entry point — TAC init, handlers, server startup
+    +-- config.ts                     # Environment configuration
+    +-- languageOptions.ts            # TTS/STT language settings
+    +-- channels/
+    |   +-- conversations-v1.ts       # Conversations v1 webhook handler + Flex handoff
+    +-- messaging/
+    |   +-- inboundMediaWebhook.ts    # Audio/image side-channel (Whisper + vision)
+    |   +-- insertCommunication.ts    # POST /Communications helper for app-side inserts
+    +-- providers/
+    |   +-- factory.ts                # LLM provider factory
+    |   +-- types.ts                  # LLMProvider interface and ToolAction types
+    |   +-- streamBuffer.ts           # Word-boundary buffer for voice TTS
+    |   +-- openai-chat-completions.ts
+    |   +-- openai-responses.ts
+    |   +-- openai-agents.ts
+    |   +-- langflow.ts               # Visual-flow brain (LLM_PROVIDER=langflow)
+    +-- prompts/
+    |   +-- systemPrompt.ts           # System prompt (persona, guidelines, tool instructions)
+    |   +-- additionalContext.ts      # Dynamic context (date/time)
+    +-- tools/
+    |   +-- index.ts                  # Tool definitions and executeTool()
+    |   +-- *.ts                      # Individual tool implementations
+    +-- data/
+        +-- mock-data.ts              # Mock data for tool responses
 ```
 
 ## Scripts
@@ -529,6 +572,24 @@ The template applies a per-conversation debounce window for **messaging channels
 The debounce also coordinates with in-flight LLM calls: if a new message arrives mid-turn, it's appended to the buffer and a fresh debounce kicks in once the current turn completes. Avoids overlapping responses.
 
 A typing indicator (WhatsApp only — Twilio's typing-indicator API is messaging-channel-specific) fires immediately on every inbound message, before the buffer/debounce logic. Customers see "typing…" within ~50ms of sending, refreshed on every additional message — natural discouragement against piling up more messages while the agent works.
+
+### How does the agent know the channel changed mid-conversation?
+
+ConversationRelay, WhatsApp, and SMS share the same TAC `conversationId` for a given customer — that's what makes a WhatsApp→voice handoff (e.g., a Content Template with a `VOICE_CALL` button) land as a *continuation* of the existing conversation rather than a fresh one. The LLM still needs to know **which channel it's on right now**, because voice and messaging want very different output shapes (TTS-friendly short prose vs. markdown + emoji).
+
+The template injects a `Current communication channel: <channel>` system context via the provider's `addSystemContext`, lazily — only when the channel string changes for a given conversation (tracked in a per-conversation `Map`).
+
+The catch: every provider's `addSystemContext` is **append-only**. On a switch, naively calling it again leaves *two* contradictory `Current communication channel:` lines in the prompt, and the recent assistant turns (chat-shaped) tend to anchor the model on the old framing. A WhatsApp customer who taps a "Falar agora" button and lands in voice would still hear the agent say *"é só tocar no botão"*.
+
+The fix in [app.ts](src/app.ts) is to make the new injection explicit about supersede on transitions:
+
+```
+Communication channel switched from "whatsapp" to "voice". IGNORE any earlier
+"Current communication channel:" line — only the most recent one is authoritative.
+Current channel: voice.
+```
+
+First-ever injection (no `prev`) stays as the plain `Current communication channel: <channel>` so we don't pollute the prompt with a fake "switched from undefined" line. Future cleanup: extend `LLMProvider` with a replace-by-key context primitive, so any keyed system context (channel, profile snapshot, etc.) supersedes naturally without the prompt-engineered hint. Until then, this prompt-level fix covers every provider — OpenAI Chat Completions, Responses, Agents, and Langflow — without API changes.
 
 ### Why a side-channel for inbound media (audio, eventually images)?
 
@@ -590,6 +651,17 @@ OpenAI's streaming APIs (and Anthropic's, and most LLM providers) emit deltas as
 The fix lives in [src/providers/streamBuffer.ts](src/providers/streamBuffer.ts): a `bufferAtWordBoundaries` async-generator wrapper that holds the partial trailing word until whitespace arrives, then yields whole words. Applied once at the voice call site in [app.ts](src/app.ts) so any provider — OpenAI Responses, OpenAI Chat Completions, OpenAI Agents SDK, Anthropic, local LLMs — benefits without per-provider code. Messaging channels skip the wrapper entirely (they call `generateResponse`, not `sendStreamingResponse`), so markdown/emoji output is unaffected.
 
 Cost: one delta of latency. Benefit: dramatically smoother TTS, plus correct pronunciation for any non-English voice deployment.
+
+## Deployment
+
+A two-stage [`Dockerfile`](Dockerfile) at the repo root builds a production image (Node 20 Alpine, `tini` as PID 1 for clean WebSocket draining on SIGTERM, runs as a non-root user, drops devDependencies, health-checks `/health`):
+
+```bash
+docker build -t conversation-relay-tac .
+docker run --rm -p 3000:3000 --env-file .env conversation-relay-tac
+```
+
+For cloud hosting — host requirements (long-lived WebSocket support, stable HTTPS URL, near-zero cold start), single-instance vs. horizontally-scaled state model, and per-provider configs — see [`deploy/README.md`](deploy/README.md). The TL;DR: most adopters need zero code changes; the deployment delta is just a stable domain, secrets via the host's secret manager, and pointing the existing Twilio webhooks at the new URL.
 
 ## Known limitations
 

@@ -1,0 +1,51 @@
+# Build artifacts — regenerated inside the container.
+node_modules/
+dist/
+
+# Source control + tooling.
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# Local config and secrets. NEVER ship to the image — supply via the host's
+# secret manager at runtime.
+.env
+.env.*
+*.local
+
+# IDE / OS noise.
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Logs and coverage.
+*.log
+coverage/
+
+# Tests are not run inside the runtime image.
+**/*.test.ts
+**/*.spec.ts
+__tests__/
+
+# Documentation (not needed at runtime — keeping the image small).
+README.md
+ARCHITECTURE.md
+HUMANIZING_AGENTS.md
+KNOWLEDGE.md
+DEPLOYING_AGENTS.md
+MIGRATION_FOLLOWUP.md
+LICENSE
+
+# Deploy configs (per-host bits live elsewhere; not bundled into the image).
+deploy/
+
+# Operator / one-off scripts (e.g. KB upload) and source knowledge files —
+# Memora holds knowledge at runtime, no need to bundle the source markdown.
+scripts/
+knowledge/
+
+# The Dockerfile itself.
+Dockerfile
+.dockerignore

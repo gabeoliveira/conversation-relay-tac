@@ -121,11 +121,22 @@ async function processInboundMessage(
     return;
   }
 
-  // Find the active conversation for this customer/agent address pair.
-  const targetConv = await findActiveConversation(tac, from, to);
+  // Derive the channel from the inbound address prefix. Programmable
+  // Messaging webhooks for WhatsApp use a `whatsapp:` prefix; SMS doesn't.
+  // RCS and Chat aren't currently emitted by this webhook path.
+  const channel: ChannelMatch =
+    from.toLowerCase().startsWith('whatsapp:') || to.toLowerCase().startsWith('whatsapp:')
+      ? 'WHATSAPP'
+      : 'SMS';
+
+  // Find the active conversation for this customer/agent address pair *on
+  // the inbound channel*. Filtering by channel (not just address) avoids
+  // matching a voice conversation whose customer participant has profile-
+  // linked WhatsApp addresses attached to it.
+  const targetConv = await findActiveConversation(tac, from, to, channel);
   if (!targetConv) {
     console.warn(
-      `[InboundMedia] no active conversation found for ${maskAddress(from)} → ${maskAddress(to)}; ` +
+      `[InboundMedia] no active ${channel} conversation found for ${maskAddress(from)} → ${maskAddress(to)}; ` +
       'customer needs to send a text message first to establish a conversation.'
     );
     return;
@@ -226,7 +237,14 @@ interface ActiveConv {
   agent: ParticipantRef;
 }
 
-async function findActiveConversation(tac: TAC, fromAddr: string, toAddr: string): Promise<ActiveConv | null> {
+type ChannelMatch = 'WHATSAPP' | 'SMS' | 'CHAT' | 'RCS';
+
+async function findActiveConversation(
+  tac: TAC,
+  fromAddr: string,
+  toAddr: string,
+  channel: ChannelMatch,
+): Promise<ActiveConv | null> {
   const cfg = tac.getConfig();
   const baseUrl = cfg.region
     ? `https://conversations.${cfg.region}.twilio.com`
@@ -236,6 +254,12 @@ async function findActiveConversation(tac: TAC, fromAddr: string, toAddr: string
   let pageToken: string | undefined;
   let scanned = 0;
   const maxToScan = 200;
+
+  // Match only when an address entry has both the expected address AND the
+  // expected channel. Prevents profile-linked WhatsApp addresses on a voice
+  // participant from matching when the inbound media is on WhatsApp.
+  const addrMatches = (a: { address?: string; channel?: string }, expected: string) =>
+    a.address === expected && a.channel === channel;
 
   while (scanned < maxToScan) {
     const url = new URL(`${baseUrl}/v2/Conversations`);
@@ -261,15 +285,18 @@ async function findActiveConversation(tac: TAC, fromAddr: string, toAddr: string
     };
     for (const conv of data.conversations ?? []) {
       const customer = conv.participants?.find((p) =>
-        p.addresses?.some((a) => a.address === fromAddr)
+        p.addresses?.some((a) => addrMatches(a, fromAddr)),
       );
       const agent = conv.participants?.find((p) =>
-        p.addresses?.some((a) => a.address === toAddr)
+        p.addresses?.some((a) => addrMatches(a, toAddr)),
       );
       if (customer && agent && customer.id !== agent.id) {
-        const customerAddr = customer.addresses?.find((a) => a.address === fromAddr);
-        const agentAddr = agent.addresses?.find((a) => a.address === toAddr);
+        const customerAddr = customer.addresses?.find((a) => addrMatches(a, fromAddr));
+        const agentAddr = agent.addresses?.find((a) => addrMatches(a, toAddr));
         if (!customerAddr?.channel || !agentAddr?.channel || !customerAddr.address || !agentAddr.address) continue;
+        console.log(
+          `[InboundMedia] matched ${channel} conversation ${conv.id} for ${maskAddress(fromAddr)} → ${maskAddress(toAddr)}`,
+        );
         return {
           conversationId: conv.id,
           customer: {

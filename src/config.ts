@@ -8,9 +8,11 @@ export const config = {
   // Memory recall strategy:
   //   'always'       - TAC calls Memory Recall before every inbound message (TAC default behavior)
   //   'never'        - no automatic recall; LLM gets no memory context
-  //   'first-prompt' - template-level pattern: recall once on first message of a
-  //                    conversation, reuse cached response for subsequent turns
-  //                    (cuts Memory API cost on long conversations)
+  //   'first-prompt' - template-level pattern: recall once per conversation,
+  //                    reuse cached response for subsequent turns. For voice,
+  //                    pre-fetches on ConversationRelay's `setup` event so the
+  //                    recall round-trip runs in parallel with the welcome
+  //                    greeting — saves ~400-1000 ms on the first response.
   memoryRecallMode: (process.env.MEMORY_RECALL_MODE || 'always') as
     | 'always'
     | 'never'
@@ -42,7 +44,8 @@ export const config = {
     provider: (process.env.LLM_PROVIDER || 'openai-chat-completions') as
       | 'openai-chat-completions'
       | 'openai-responses'
-      | 'openai-agents',
+      | 'openai-agents'
+      | 'langflow',
     model: process.env.LLM_MODEL || 'gpt-4.1',
   },
   openai: {
@@ -50,6 +53,16 @@ export const config = {
     maxCompletionTokens: process.env.OPENAI_MAX_COMPLETION_TOKENS
       ? parseInt(process.env.OPENAI_MAX_COMPLETION_TOKENS, 10)
       : undefined,
+  },
+  // Langflow is an optional alternative LLM backend, selected via
+  // LLM_PROVIDER=langflow. The flow itself owns prompt, tools, knowledge —
+  // TAC just streams turns through it and prepends memory/channel context
+  // (which TAC fetches via the existing pipeline and accumulates through
+  // addSystemContext) to the user input. See LANGFLOW_PROVIDER_PLAN.md.
+  langflow: {
+    baseUrl: process.env.LANGFLOW_BASE_URL,
+    flowId: process.env.LANGFLOW_FLOW_ID,
+    apiKey: process.env.LANGFLOW_API_KEY,
   },
   twilio: {
     workflowSid: process.env.TWILIO_WORKFLOW_SID,

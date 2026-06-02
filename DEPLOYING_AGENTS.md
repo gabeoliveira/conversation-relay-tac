@@ -147,6 +147,20 @@ createApp({
   // Optional overrides:
   // welcomeGreeting: 'Welcome to Acme Corp! How can I help you?',
   // defaultLanguage: { locale_code: 'en-US', ttsProvider: 'google', voice: 'en-US-Journey-O', ... },
+  // additionalContext: () => `Date: ${new Date().toISOString()}`,
+  //
+  // Per-conversation tool factory — runs once when the LLM provider is
+  // created. Use for tools that need a runtime dependency like the TAC
+  // KnowledgeClient. The porto demo uses this to conditionally add
+  // `search_porto_faz_kb` only when KB_PORTO_FAZ_ID is set.
+  // buildDynamicTools: (tac) => [...],
+  //
+  // Per-turn tool factory — runs on EVERY inbound message with the live
+  // ConversationSession bound in. Returned tools override same-named static
+  // tools for that turn only. Use for runtime guards that need to see the
+  // current channel (e.g., refuse to send a WhatsApp CTA when channel is
+  // `voice`). The porto demo uses this to wrap `send_after_hours_call_cta`.
+  // buildSessionTools: (tac, session) => [...],
 });
 ```
 
@@ -204,6 +218,8 @@ That's it. Everything else — TAC setup, channel management, memory injection, 
 | **Voice greeting** | Pass `welcomeGreeting` to `createApp()` | `src/index.ts` |
 | **Voice language** | Pass `defaultLanguage` to `createApp()` | `src/index.ts` |
 | **Dynamic context** | Pass `additionalContext` function to `createApp()` | `src/index.ts` |
+| **Dynamic tools** (per-conversation) | Pass `buildDynamicTools(tac)` to `createApp()` | `src/index.ts` |
+| **Session-bound tools** (per-turn) | Pass `buildSessionTools(tac, session)` to `createApp()` | `src/index.ts` |
 | **LLM provider** | Set `LLM_PROVIDER` in `.env` | `.env` |
 | **LLM model** | Set `LLM_MODEL` in `.env` | `.env` |
 | **Messaging mode** | Set `MESSAGING_MODE` in `.env` | `.env` |

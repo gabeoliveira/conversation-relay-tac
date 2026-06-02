@@ -243,6 +243,7 @@ The template adds two pieces on top:
   - `always` — TAC calls `retrieveMemory` before every inbound message (TAC native).
   - `never` — no automatic recall; the LLM gets no memory context.
   - `first-prompt` — template-level pattern. TAC channels are constructed with `memoryMode: 'never'`; the app calls `tac.retrieveMemory` once on the conversation's first message and caches the response in `memoryByConversation` for subsequent turns. Drops Memory API cost on long sessions. Tradeoff: observations added mid-conversation (e.g., by CI) only surface in the next conversation.
+    - **Voice-setup pre-fetch.** ConversationRelay fires a `setup` event when the call's WebSocket connects, several seconds before the customer's first utterance lands. In `first-prompt` mode the template listens on this event, kicks off `memoryClient.lookupProfile('phone', …)` + `retrieveMemories(profileId)` in parallel with the welcome greeting, and stashes the in-flight promise in `prefetchByPhone`. When `onMessageReady` fires for the first turn, the message handler awaits this promise instead of starting recall fresh — typically already resolved, so the first response saves the full recall round-trip (400–1000 ms in practice). Falls back transparently to a synchronous recall if the pre-fetch failed or wasn't fired (e.g., messaging-first conversations).
 
 ### Memory Injection
 
