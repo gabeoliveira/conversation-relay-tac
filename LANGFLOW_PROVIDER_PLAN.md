@@ -14,7 +14,7 @@ Three findings from a recent Langflow blog post and SDK review:
 
 1. `@datastax/langflow-client` exposes `flow.run(prompt, { session_id })` (non-streaming) and `flow.stream(prompt, { session_id })` (token-streaming).
 2. Streaming emits chunks of shape `{ event: 'token', data: { chunk: string } }` and a terminal `{ event: 'end' }`. That maps directly onto our existing `LLMProvider.streamResponse` contract (`AsyncIterable<string>`).
-3. Our [`bufferAtWordBoundaries`](src/providers/streamBuffer.ts) wrapper is provider-agnostic — any source of sub-word deltas works. Langflow's stream slots in unchanged.
+3. Our [`bufferAtClauseBoundaries`](src/providers/streamBuffer.ts) wrapper is provider-agnostic — any source of sub-word deltas works. Langflow's stream slots in unchanged.
 
 ## Design decisions (already taken)
 
@@ -50,9 +50,9 @@ Both Langflow APIs accept `session_id`. We pass TAC's `conversationId` — the M
 - Cross-channel continuity under `GROUP_BY_PROFILE` (voice + WhatsApp on the same conversationId share Langflow session state).
 - Langflow's built-in Chat Memory component, if used, picks up the right turn history.
 
-### 5. Voice streaming uses `bufferAtWordBoundaries` unchanged
+### 5. Voice streaming uses `bufferAtClauseBoundaries` unchanged
 
-No special handling for sub-word Langflow chunks. The existing word-boundary buffer at the call site in [`src/app.ts`](src/app.ts) consumes any `AsyncIterable<string>` and produces clean whole-word chunks for ConversationRelay TTS.
+No special handling for sub-word Langflow chunks. The existing clause-boundary buffer at the call site in [`src/app.ts`](src/app.ts) consumes any `AsyncIterable<string>` and produces clean whole-clause chunks for ConversationRelay TTS.
 
 ### 6. `addSystemContext` accumulates; nothing is dropped
 
@@ -158,7 +158,7 @@ Clear delimiter so the flow's LLM can recognize the context block as system inst
     // chunk.event === 'error' or unexpected: throw or log + break
   }
   ```
-- The `for await ... yield` shape produces an `AsyncIterable<string>` that the voice path wraps in `bufferAtWordBoundaries`.
+- The `for await ... yield` shape produces an `AsyncIterable<string>` that the voice path wraps in `bufferAtClauseBoundaries`.
 
 ### `getLastAction()`, `clearLastAction()`
 
@@ -190,7 +190,7 @@ First pass. Documented limitation.
 The provider is "done" when all of these hold:
 
 1. Setting `LLM_PROVIDER=langflow` and the three env vars is sufficient to run the template against a working Langflow flow.
-2. Voice calls stream tokens through `bufferAtWordBoundaries` without modification, with audible quality equivalent to the OpenAI providers (assuming the customer enabled streaming in their flow's model component).
+2. Voice calls stream tokens through `bufferAtClauseBoundaries` without modification, with audible quality equivalent to the OpenAI providers (assuming the customer enabled streaming in their flow's model component).
 3. Messaging (WhatsApp / SMS) responses come back cleanly via `flow.run`.
 4. Memory recall modes (`always`, `never`, `first-prompt`) all work — the provider observes the memory pipeline via accumulated `addSystemContext` calls and prepends correctly.
 5. Channel awareness injection works — the provider sees `Current communication channel: <channel>` as context.

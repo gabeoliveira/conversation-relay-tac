@@ -495,7 +495,7 @@ If the Conversation Configuration has `conversationsV1Bridge` enabled, CO create
 
 ### 10.4 Voice TTS duplicated tokens
 
-"Re-foi remarcado" sounds like duplicated tokens, but is usually TTS chunk-boundary stutter, not actual duplication. Verify with `VOICE_STREAM_DEBUG=true` (taps the raw provider stream + post-buffer stream). If both logs show "foi" once but you hear "re-foi", it's TTS. Mitigation: buffer at clause/sentence boundaries instead of word boundaries, but visit only if measurably impactful.
+"Re-foi remarcado" sounds like duplicated tokens, but is usually TTS chunk-boundary stutter, not actual duplication. Verify with `VOICE_STREAM_DEBUG=true` (taps the raw provider stream + post-buffer stream). If both logs show "foi" once but you hear "re-foi", it's TTS. The template already buffers voice at **clause/sentence boundaries** (`bufferAtClauseBoundaries`, the default at the call site) to minimize this — see §10.13 for why clause-boundary beats word-boundary across models.
 
 ### 10.5 Payment template amounts must match EXACTLY
 
@@ -533,6 +533,14 @@ Memory store trait groups have a registered schema. The Create Profile (POST) en
 ### 10.12 Memora read-after-write lag
 
 Observations written via POST aren't immediately readable via the list endpoint — there's a 0.5-3s lag while the index updates. Tools that write an observation and then expect a subsequent tool (in the same agent turn) to read it will see an empty list. Either poll for visibility before returning, or use a different pattern (e.g., pass state via tool return value, not via Memora roundtrip).
+
+### 10.13 Faster model ≠ smoother voice — streaming cadence is the lever, not TTS
+
+The LLM never synthesizes audio, but in ConversationRelay it's the **producer feeding a streaming TTS**, so voice smoothness tracks the *shape* of its token stream. Two models with identical TTS sound different: a smaller/faster variant often has **lower time-to-first-token but higher inter-token-latency variance** (burstier) and **choppier punctuation** — both render as stutter. Real report: same app, the `-mini` model stuttered noticeably more than the full model, even though it never touches TTS.
+
+**Fix (the template default):** the voice call site buffers at **clause boundaries** — `bufferAtClauseBoundaries` in [src/providers/streamBuffer.ts](src/providers/streamBuffer.ts) — feeding the TTS whole clauses so smoothness stops tracking per-model cadence (word-boundary fallback for long comma-less runs). See §10.4 and [HUMANIZING_AGENTS.md](HUMANIZING_AGENTS.md) §1.
+
+**Diagnose:** `VOICE_STREAM_DEBUG=true` taps the raw + post-buffer streams (compare a model's raw chunking); `VOICE_LATENCY_DEBUG=true` logs the first-token→first-flush wait. If a backend is still choppy, pin the smoother model for voice and keep the faster one for messaging — behavior isn't identical across models behind a gateway (§2.3).
 
 ---
 

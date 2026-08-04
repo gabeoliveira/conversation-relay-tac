@@ -32,7 +32,7 @@ An AI-powered conversational assistant built on **Twilio Agent Connect (TAC)** t
 - **Typing Indicators**: WhatsApp typing indicators via Programmable Messaging API
 - **Tool System**: Extensible tools using TAC's `defineTool` / `TACTool`
 - **Conversation Intelligence**: Maestro passive capture feeds CI operators
-- **Humanization patterns**: Word-boundary TTS streaming, message debouncing, eager typing indicators, interrupt-aware context, channel-adaptive output (see [HUMANIZING_AGENTS.md](HUMANIZING_AGENTS.md))
+- **Humanization patterns**: Clause-boundary TTS streaming, message debouncing, eager typing indicators, interrupt-aware context, channel-adaptive output (see [HUMANIZING_AGENTS.md](HUMANIZING_AGENTS.md))
 
 ## Prerequisites
 
@@ -439,7 +439,7 @@ LANGFLOW_API_KEY=<optional, if auth is enabled>
 
 - Calls `flow.run` (messaging) or `flow.stream` (voice) on every turn, passing the customer message and TAC's `conversationId` as `session_id`.
 - Concatenates everything TAC injects via `addSystemContext` (memory, channel, customer phone, additional context) and **prepends it to the user prompt** under a `[Context] ... [Message] ...` header before sending. Memory recall modes (`always` / `never` / `first-prompt`) all work transparently.
-- Passes voice tokens directly into [`bufferAtWordBoundaries`](src/providers/streamBuffer.ts), so TTS quality matches the OpenAI providers — provided you've enabled streaming on the model component inside the flow.
+- Passes voice tokens directly into [`bufferAtClauseBoundaries`](src/providers/streamBuffer.ts), so TTS quality matches the OpenAI providers — provided you've enabled streaming on the model component inside the flow.
 
 **Limitations of the first-pass integration** (see [LANGFLOW_PROVIDER_PLAN.md](LANGFLOW_PROVIDER_PLAN.md) for full context):
 
@@ -511,7 +511,7 @@ Tools are defined using TAC's `defineTool()` and executed via a unified `execute
     +-- providers/
     |   +-- factory.ts                # LLM provider factory
     |   +-- types.ts                  # LLMProvider interface and ToolAction types
-    |   +-- streamBuffer.ts           # Word-boundary buffer for voice TTS
+    |   +-- streamBuffer.ts           # Clause-boundary buffer for voice TTS
     |   +-- openai-chat-completions.ts
     |   +-- openai-responses.ts
     |   +-- openai-agents.ts
@@ -641,16 +641,17 @@ The inserted communication:
 
 Channels supported: `WHATSAPP`, `SMS`, `CHAT`, `RCS`. Voice transcripts arrive natively via ConversationRelay, so this isn't needed for voice. Strong upstream PR candidate for TAC's `ConversationClient`.
 
-### Why buffer LLM streams to word boundaries on voice?
+### Why buffer LLM streams to clause boundaries on voice?
 
-OpenAI's streaming APIs (and Anthropic's, and most LLM providers) emit deltas as sub-word fragments — often 1-3 characters at a time. Forwarding each delta verbatim to ConversationRelay's TTS produces two distinct problems:
+OpenAI's streaming APIs (and Anthropic's, and most LLM providers) emit deltas as sub-word fragments — often 1-3 characters at a time, and *how burstily* they do so varies by model. Forwarding each delta verbatim to ConversationRelay's TTS produces three problems:
 
 1. **Stuttering at chunk boundaries.** TTS engines have to coalesce sub-word tokens on the fly; at chunk boundaries the audio can repeat or drop tokens.
 2. **Mispronunciation of digraphs in non-English languages.** TTS applies grapheme-to-phoneme rules per chunk. When `manhã` arrives as `man` + `hã`, the engine has already committed to a /n/ for the `n` before the `h` arrives — so you get /man.ha/ instead of the correct /ma.ɲɐ̃/. Same issue applies to Portuguese `nh`/`lh`/`ch`/`rr`, Spanish `ll`/`rr`, French `gn`/`ch`, English `th`/`sh`/`ph`, etc.
+3. **Per-model cadence sensitivity.** A smaller/faster model often streams choppier — higher inter-token-latency variance, more fragmented punctuation — so word-at-a-time forwarding turns into per-word stutter that a smoother model wouldn't show, even though the model never touches TTS.
 
-The fix lives in [src/providers/streamBuffer.ts](src/providers/streamBuffer.ts): a `bufferAtWordBoundaries` async-generator wrapper that holds the partial trailing word until whitespace arrives, then yields whole words. Applied once at the voice call site in [app.ts](src/app.ts) so any provider — OpenAI Responses, OpenAI Chat Completions, OpenAI Agents SDK, Anthropic, local LLMs — benefits without per-provider code. Messaging channels skip the wrapper entirely (they call `generateResponse`, not `sendStreamingResponse`), so markdown/emoji output is unaffected.
+The fix lives in [src/providers/streamBuffer.ts](src/providers/streamBuffer.ts): a `bufferAtClauseBoundaries` async-generator wrapper that holds text until a clause/sentence boundary (`. , ; : ! ? …` or newline), then yields whole clauses — with a word-boundary fallback (`bufferAtWordBoundaries`, retained) so a long comma-less run never stalls. Feeding the TTS whole clauses instead of single words makes voice smoothness robust to per-model streaming cadence. Applied once at the voice call site in [app.ts](src/app.ts) so any provider — OpenAI Responses, OpenAI Chat Completions, OpenAI Agents SDK, Anthropic, local LLMs — benefits without per-provider code. Messaging channels skip the wrapper entirely (they call `generateResponse`, not `sendStreamingResponse`), so markdown/emoji output is unaffected.
 
-Cost: one delta of latency. Benefit: dramatically smoother TTS, plus correct pronunciation for any non-English voice deployment.
+Cost: up to one clause of latency (usually sub-second). Benefit: dramatically smoother TTS, robust across models, plus correct pronunciation for any non-English voice deployment. Instrument the first-token→first-flush wait with `VOICE_LATENCY_DEBUG=true`.
 
 ## Deployment
 

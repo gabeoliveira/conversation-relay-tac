@@ -24,7 +24,7 @@ This document provides a technical deep-dive into the architecture, component in
 The application is structured in three layers:
 
 1. **TAC Package** (`twilio-agent-connect@^1.0.0`) — single npm package: channel management, Maestro/Memora/Knowledge API clients, Fastify server, webhook handling, OOTB tools (knowledge search, Studio handoff), memory prompt builder
-2. **Application Layer** (`src/app.ts` + supporting modules) — LLM orchestration, tool execution, memory + channel + profile injection, mode-based routing, humanization patterns (word-boundary streaming, message debouncing, typing indicators), inbound media side-channel
+2. **Application Layer** (`src/app.ts` + supporting modules) — LLM orchestration, tool execution, memory + channel + profile injection, mode-based routing, humanization patterns (clause-boundary streaming, message debouncing, typing indicators), inbound media side-channel
 3. **Channel Handlers** — Maestro channels (via TAC's `VoiceChannel` / `SMSChannel` / `WhatsAppChannel`) or Conversations v1 (custom handler at `src/channels/conversations-v1.ts`)
 
 TAC handles the infrastructure concerns (WebSocket protocol, webhook validation, session lifecycle, dedup, API clients), while the application layer owns the business logic (what the AI says, which tools it can call, how memory is used) and the *texture* of the conversation (pacing, prosody, channel adaptation) — see [HUMANIZING_AGENTS.md](HUMANIZING_AGENTS.md).
@@ -61,7 +61,7 @@ All of TAC's surface lives in a single npm package. Key exports used by the temp
 | `src/app.ts` | Boots TAC, registers channels, wires the message handler (with debounce + in-flight serialization), starts the server, wires the inbound-media webhook |
 | `src/config.ts` | App-specific config (messaging mode, memory recall mode, debounce window, inbound-media flags, LLM provider) |
 | `src/providers/*.ts` | Three OpenAI LLM providers (`openai-chat-completions`, `openai-responses`, `openai-agents`) implementing `LLMProvider` |
-| `src/providers/streamBuffer.ts` | `bufferAtWordBoundaries(asyncIterable)` — provider-agnostic word-boundary buffer applied to voice streams to remove TTS stuttering and digraph mispronunciation |
+| `src/providers/streamBuffer.ts` | `bufferAtClauseBoundaries(asyncIterable)` — provider-agnostic clause-boundary buffer applied to voice streams; feeds TTS whole clauses so smoothness doesn't track per-model streaming cadence (falls back to `bufferAtWordBoundaries` for long comma-less runs). Removes TTS stuttering + digraph mispronunciation |
 | `src/tools/index.ts` | Tool definitions using `defineTool()`; `executeTool(name, args, tools)` runs the tool by name for the Chat Completions / Responses providers |
 | `src/tools/knowledgeTools.ts` | Builds KB search tools dynamically from `KB_*_ID` env vars using TAC's `createKnowledgeTools` |
 | `src/channels/conversations-v1.ts` | Conversations v1 webhook handler, typing indicators, direct Flex Interactions API handoff (only used when `MESSAGING_MODE=conversations-v1`) |
@@ -89,11 +89,13 @@ All of TAC's surface lives in a single npm package. Key exports used by the temp
       - injects memory + profile traits via MemoryPromptBuilder
       - adds createStudioHandoffTool to the per-message tool list
  8. voiceChannel.sendStreamingResponse(
-        bufferAtWordBoundaries(provider.streamResponse(...))
+        bufferAtClauseBoundaries(provider.streamResponse(...))
     )
-    Word-boundary wrapper buffers sub-word deltas to whitespace boundaries
-    before forwarding to ConversationRelay — eliminates TTS stuttering and
-    digraph mispronunciation (pt manhã, nh/lh/ch/rr; es ll/rr; fr gn/ch).
+    Clause-boundary wrapper buffers deltas to clause/sentence punctuation
+    (word-boundary fallback for long runs) before forwarding to
+    ConversationRelay — feeds TTS whole clauses so voice smoothness doesn't
+    track per-model streaming cadence; eliminates TTS stuttering and digraph
+    mispronunciation (pt manhã, nh/lh/ch/rr; es ll/rr; fr gn/ch).
  9. ConversationRelay synthesizes speech in real-time
 10. On interrupt: VoiceChannel cancels the stream task via AbortController;
     onInterrupt fires; the app injects "[Interruption] customer heard X" as
@@ -294,7 +296,7 @@ TAC 1.0.0 (the published npm package) absorbed almost all of the patches that th
 
 | Layer | What | Where |
 |---|---|---|
-| Voice quality | Word-boundary buffering of LLM streams before TTS | [src/providers/streamBuffer.ts](src/providers/streamBuffer.ts), applied in [src/app.ts](src/app.ts) |
+| Voice quality | Clause-boundary buffering of LLM streams before TTS (word-boundary fallback for long runs) | [src/providers/streamBuffer.ts](src/providers/streamBuffer.ts), applied in [src/app.ts](src/app.ts) |
 | Messaging pacing | Per-conversation debounce + in-flight serialization | [src/app.ts](src/app.ts) (`debounceStates`, `fireDebounce`, `processMessageTurn`) |
 | WhatsApp typing | Eager indicator on every inbound message via Programmable Messaging REST | [src/app.ts](src/app.ts) (`sendWhatsAppTypingIndicator`) |
 | Channel awareness | `Current communication channel: <channel>` system message, re-injected on channel change | [src/app.ts](src/app.ts) (`lastChannelByConversation`) |
@@ -314,7 +316,7 @@ The customer-facing playbook for these patterns lives in [HUMANIZING_AGENTS.md](
 
 ### Voice TTS stuttering and digraph mispronunciation
 
-LLM providers emit sub-word delta chunks during streaming. Forwarded verbatim to ConversationRelay, these produce audible stuttering at chunk boundaries and mispronunciation of non-English digraphs (Portuguese `manhã`, `nh`/`lh`/`ch`/`rr`; Spanish `ll`/`rr`; French `gn`/`ch`; English `th`/`sh`/`ph`). The template mitigates this by wrapping the LLM stream in `bufferAtWordBoundaries` before handing it to `sendStreamingResponse`. Cost: at most one delta of buffering latency. See [HUMANIZING_AGENTS.md §1](HUMANIZING_AGENTS.md#1-word-boundary-streaming-voice-tts).
+LLM providers emit sub-word delta chunks during streaming, and how *burstily* they do so varies by model — a smaller/faster variant often streams choppier, which the TTS renders as stutter even though the model never touches audio. Forwarded verbatim to ConversationRelay, sub-word chunks also mispronounce non-English digraphs (Portuguese `manhã`, `nh`/`lh`/`ch`/`rr`; Spanish `ll`/`rr`; French `gn`/`ch`; English `th`/`sh`/`ph`). The template wraps the LLM stream in `bufferAtClauseBoundaries` before handing it to `sendStreamingResponse` — feeding the TTS whole clauses makes smoothness robust to per-model cadence (with a word-boundary fallback for long comma-less runs). Cost: up to one clause of buffering (usually sub-second). See [HUMANIZING_AGENTS.md §1](HUMANIZING_AGENTS.md#1-clause-boundary-streaming-voice-tts).
 
 ### Memory Retrieval on Every Voice Prompt
 

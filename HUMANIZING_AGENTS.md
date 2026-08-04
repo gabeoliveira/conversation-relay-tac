@@ -22,7 +22,7 @@ exhaustive — treat it as a starting checklist.
 
 | # | Pattern | Channel | Why it matters | Lives in |
 |---|---|---|---|---|
-| 1 | **Word-boundary streaming** | Voice | Removes TTS stuttering and fixes non-English digraph pronunciation | [src/providers/streamBuffer.ts](src/providers/streamBuffer.ts) |
+| 1 | **Clause-boundary streaming** | Voice | Removes TTS stuttering, fixes non-English digraph pronunciation, and makes voice robust to per-model streaming cadence | [src/providers/streamBuffer.ts](src/providers/streamBuffer.ts) |
 | 2 | **Message debouncing** | Messaging | Combines rapid-fire customer messages into one LLM turn instead of two half-formed replies | [src/app.ts](src/app.ts) (`debounceStates` / `fireDebounce`) |
 | 3 | **In-flight serialization** | Messaging | New messages mid-turn don't trigger a parallel reply — they're appended and run next | [src/app.ts](src/app.ts) (`inFlight` flag) |
 | 4 | **Eager typing indicator** | WhatsApp | Customer sees "typing…" within ~50ms, before the debounce window opens | [src/app.ts](src/app.ts) (`sendWhatsAppTypingIndicator`) |
@@ -37,13 +37,14 @@ The rest of this document explains each pattern in detail.
 
 ---
 
-## 1. Word-boundary streaming (voice TTS)
+## 1. Clause-boundary streaming (voice TTS)
 
 ### The problem
 
 OpenAI's streaming APIs — and most LLM providers — emit deltas as sub-word
-fragments, often 1–3 characters at a time. Forward each delta directly to
-ConversationRelay and two distinct things go wrong:
+fragments, often 1–3 characters at a time, and *how burstily* they do so varies
+by model. Forward each delta directly to ConversationRelay and three distinct
+things go wrong:
 
 - **Stuttering at chunk boundaries.** TTS engines have to coalesce sub-word
   tokens on the fly. At chunk boundaries the audio can repeat or drop
@@ -54,12 +55,21 @@ ConversationRelay and two distinct things go wrong:
   — so you get /man.ha/ instead of the correct /ma.ɲɐ̃/. Same family of
   problems for Portuguese `nh`/`lh`/`ch`/`rr`, Spanish `ll`/`rr`, French
   `gn`/`ch`, English `th`/`sh`/`ph`.
+- **Per-model cadence sensitivity.** A smaller/faster model often streams
+  choppier — higher inter-token-latency variance, more fragmented punctuation
+  — so word-at-a-time forwarding becomes per-word stutter that a smoother model
+  wouldn't show, even though the model never touches TTS.
 
 ### The fix
 
 Wrap the LLM stream in an async generator that buffers until the next
-whitespace/newline, then yields a clean run of whole words. Implementation:
-[src/providers/streamBuffer.ts](src/providers/streamBuffer.ts).
+clause/sentence boundary (`. , ; : ! ? …` or newline), then yields a whole
+clause — with a word-boundary fallback so a long comma-less run never stalls.
+Feeding the TTS whole clauses instead of single words makes voice smoothness
+robust to per-model streaming cadence. Implementation:
+[src/providers/streamBuffer.ts](src/providers/streamBuffer.ts)
+(`bufferAtClauseBoundaries`; the older `bufferAtWordBoundaries` stays as the
+fallback).
 
 Applied once at the voice call site in
 [src/app.ts](src/app.ts) so any provider — OpenAI Responses, Chat Completions,
@@ -68,7 +78,7 @@ the Agents SDK, Anthropic, local LLMs — benefits without per-provider code:
 ```ts
 await voiceChannel.sendStreamingResponse(
   conversationId,
-  bufferAtWordBoundaries(
+  bufferAtClauseBoundaries(
     provider.streamResponse(message, callTools, signal)
   ),
   { signal }
@@ -80,15 +90,18 @@ not the streaming path), so markdown/emoji output on WhatsApp is unaffected.
 
 ### Cost / benefit
 
-- **Cost:** at most one delta of buffering — typically a few ms. Imperceptible.
-- **Benefit:** dramatically smoother TTS, plus correct pronunciation for any
-  non-English voice deployment.
+- **Cost:** up to one clause of buffering — usually sub-second. Adds a little to
+  time-to-first-audio vs. word buffering; instrument it with
+  `VOICE_LATENCY_DEBUG=true` (logs the first-token→first-flush wait).
+- **Benefit:** dramatically smoother TTS, robust across models, plus correct
+  pronunciation for any non-English voice deployment.
 
 ### When you can skip it
 
-Never, for voice. The latency is negligible and the quality delta is
-language-dependent but always positive. We considered making it optional and
-decided no.
+Never, for voice. The clause wait is small and bounded (the word-boundary
+fallback caps the worst case), and the quality delta — smoothness +
+cadence-robustness + pronunciation — is always positive. We considered making it
+optional and decided no.
 
 ---
 
@@ -553,9 +566,9 @@ If any answer is yes, the corresponding pattern is missing or misconfigured.
 
 If you're not using this template directly, the porting order is:
 
-1. **Word-boundary streaming** — drop in
-   [src/providers/streamBuffer.ts](src/providers/streamBuffer.ts) verbatim
-   and wrap your voice stream. Provider-agnostic.
+1. **Clause-boundary streaming** — drop in
+   [src/providers/streamBuffer.ts](src/providers/streamBuffer.ts) verbatim and
+   wrap your voice stream with `bufferAtClauseBoundaries`. Provider-agnostic.
 2. **Channel-aware prompt** — copy the structure from the canonical sample prompt (voice-first channel awareness + multimedia handling sections) and adapt to your domain.
 3. **Message debounce + in-flight serialization** — pattern from
    [src/app.ts](src/app.ts) translates directly. Per-conversation state
