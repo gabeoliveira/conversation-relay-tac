@@ -33,7 +33,7 @@ import type { TACTool } from 'twilio-agent-connect';
 
 import { config } from './config.js';
 import { createLLMProvider } from './providers/factory.js';
-import { bufferAtWordBoundaries } from './providers/streamBuffer.js';
+import { bufferAtClauseBoundaries } from './providers/streamBuffer.js';
 import { registerInboundMediaWebhook } from './messaging/inboundMediaWebhook.js';
 import { getAdditionalContext } from './prompts/additionalContext.js';
 import { languageOptions, type LanguageOption } from './languageOptions.js';
@@ -200,6 +200,23 @@ export async function createApp(options: AppOptions): Promise<void> {
     lastParams: MessageReadyParams;
   };
   const debounceStates = new Map<string, DebounceState>();
+
+  // Records the wall-clock of a stream's FIRST chunk (via `onFirst`), then
+  // passes every chunk through untouched. Lets VOICE_LATENCY_DEBUG time
+  // first-token / first-flush without disturbing the stream.
+  async function* markFirst(
+    source: AsyncIterable<string>,
+    onFirst: () => void,
+  ): AsyncIterable<string> {
+    let first = true;
+    for await (const chunk of source) {
+      if (first) {
+        first = false;
+        onFirst();
+      }
+      yield chunk;
+    }
+  }
 
   // Diagnostic helper for VOICE_STREAM_DEBUG. Wraps any AsyncIterable<string>
   // and prints each chunk with a label so we can compare what the provider
@@ -569,26 +586,38 @@ export async function createApp(options: AppOptions): Promise<void> {
       const streamController = voiceChannel.startStreamTask(conversationId);
 
       try {
-        // Buffer the LLM stream to word boundaries before handing it to
-        // ConversationRelay. Avoids TTS stuttering on sub-word delta chunks.
-        // Provider-agnostic — works for any AsyncIterable<string> source.
+        // Buffer the LLM stream to CLAUSE boundaries before handing it to
+        // ConversationRelay — feeds the TTS whole clauses so voice smoothness
+        // doesn't track per-model streaming cadence. Provider-agnostic.
         //
         // VOICE_STREAM_DEBUG=true wraps the raw provider stream and the
-        // post-buffer stream with tap loggers. Use to diagnose TTS hiccups
-        // like duplicated tokens — if a word shows up twice in `raw` but
-        // once in `tts`, the source emitted it twice; if it shows up once
-        // in both but you still hear it twice, the duplication is in
-        // ConversationRelay's TTS, not us. Off by default.
+        // post-buffer stream with per-chunk tap loggers. Use to diagnose TTS
+        // hiccups: if a word shows up twice in `raw` but once in `tts`, the
+        // source emitted it twice; if once in both but you still hear it twice,
+        // the duplication is ConversationRelay's TTS, not us.
+        //
+        // VOICE_LATENCY_DEBUG=true logs the first-token→first-flush wait: the
+        // slice of the t4→t5 leg the buffer controls (TTS synthesis, first-flush
+        // → audible, is the Insights `start_of_agent_speech` event). Off by default.
         const debug = process.env.VOICE_STREAM_DEBUG === 'true';
+        const timing = debug || process.env.VOICE_LATENCY_DEBUG === 'true';
+        const t = { streamStart: Date.now(), firstToken: 0, firstFlush: 0 };
         const rawStream = provider.streamResponse(message, callTools, streamController.controller.signal);
-        const tappedRaw = debug ? tapStream(rawStream, 'raw', conversationId) : rawStream;
-        const bufferedStream = bufferAtWordBoundaries(tappedRaw);
-        const tappedBuffered = debug ? tapStream(bufferedStream, 'tts', conversationId) : bufferedStream;
+        const rawTimed = timing ? markFirst(rawStream, () => { t.firstToken = Date.now(); }) : rawStream;
+        const tappedRaw = debug ? tapStream(rawTimed, 'raw', conversationId) : rawTimed;
+        const bufferedStream = bufferAtClauseBoundaries(tappedRaw);
+        const bufferedTimed = timing ? markFirst(bufferedStream, () => { t.firstFlush = Date.now(); }) : bufferedStream;
+        const tappedBuffered = debug ? tapStream(bufferedTimed, 'tts', conversationId) : bufferedTimed;
         await voiceChannel.sendStreamingResponse(
           conversationId,
           tappedBuffered,
           { signal: streamController.controller.signal }
         );
+        if (timing && t.firstToken && t.firstFlush) {
+          console.log(
+            `[VoiceLatency] ${conversationId} firstToken=+${t.firstToken - t.streamStart}ms · firstToken->firstFlush=${t.firstFlush - t.firstToken}ms (clause-buffer wait to TTS)`,
+          );
+        }
       } catch (err) {
         if (!streamController.controller.signal.aborted) {
           console.error(`[Voice] Stream error for ${conversationId}:`, err);
@@ -717,6 +746,187 @@ export async function createApp(options: AppOptions): Promise<void> {
       status: 'ok',
       uptime: process.uptime(),
     });
+  });
+
+  // ─── Internal handoff bridge (for the Langflow provider) ──────────────────
+  //
+  // WHY THIS EXISTS. The OOTB `createStudioHandoffTool` does channel-aware
+  // handoff (voice → set session.pendingHandoffData → WS `end` redirects the
+  // live call WITH data; messaging → REST Studio execution). But it's an LLM
+  // tool wired into the `tools` array, which the **Langflow provider ignores**
+  // (tools live in the flow, and `getLastAction()` returns undefined — the
+  // flow's handoff signal can't reach TAC). A Langflow custom component that
+  // POSTs a Studio execution itself gets it wrong for voice: a REST execution
+  // is disconnected from the live call and hits the messaging branch of the
+  // Flow, while TAC's own `<Connect action>` still fires on WS-close but with
+  // an EMPTY `handoffData` (nobody set pendingHandoffData). Result: two failed
+  // executions, no working handoff.
+  //
+  // This route is the bridge. A Langflow handoff component calls it with the
+  // conversationId + reason (+ optional customer_phone/name). ALL handoff
+  // config lives on TAC (env `TWILIO_STUDIO_HANDOFF_FLOW_SID` + API creds), so
+  // the Langflow caller stays agnostic — it only knows TAC_BASE_URL. The route
+  // is channel-aware on its own: if there's a live VOICE session it sets
+  // `session.pendingHandoffData` (the SDK explicitly sanctions setting it
+  // directly — see createStudioHandoffTool docs), and the voice turn's tail
+  // sends the WS `end` message so the `<Connect action>` redirect carries real
+  // handoffData. Otherwise it's messaging → a plain Studio REST execution
+  // using TAC's own flow SID + creds (no session needed). "Is this voice?" is
+  // answered by voice-session presence — no messaging-session lookup.
+  //
+  // WHY GET (not POST). TACServer registers a GLOBAL preHandler that rejects
+  // any non-GET request without a valid Twilio webhook signature (403
+  // "Invalid webhook signature") — it can't be exempted per-route from the
+  // template. The hook explicitly skips GET, so this route is a GET. Params
+  // ride the query string. This mutates state via GET, which is unusual, but
+  // it's an internal RPC control endpoint called by exactly one trusted
+  // client, not a cacheable public resource. Optional shared-secret gate via
+  // INTERNAL_HANDOFF_TOKEN (query `token` or `x-internal-handoff-token`).
+  //
+  // INERT for the openai-* path (that path uses the OOTB tool and never calls
+  // this route).
+  //
+  // Single-instance note: the session lives on the instance holding the voice
+  // WebSocket. Keep the voice app single-machine (or sticky) so this call
+  // lands on the same instance — the default fly.toml for voice already does.
+  server.fastify.get('/internal/handoff', async (req, reply) => {
+    const q = (req.query ?? {}) as {
+      conversationId?: string;
+      reason?: string;
+      customer_phone?: string;
+      customer_name?: string;
+      source?: string;
+      token?: string;
+    };
+
+    const expectedToken = process.env.INTERNAL_HANDOFF_TOKEN;
+    if (expectedToken) {
+      const provided = q.token ?? req.headers['x-internal-handoff-token'];
+      if (provided !== expectedToken) {
+        return reply.status(401).send({ error: 'unauthorized' });
+      }
+    }
+
+    const conversationId = q.conversationId;
+    const reason = (q.reason ?? 'Handoff requested').toString();
+    if (!conversationId) {
+      return reply.status(400).send({ error: 'conversationId required' });
+    }
+
+    const memoryStoreId = tac.getMemoryStoreId() ?? '';
+    const tcfg = tac.getConfig();
+
+    // The Studio Flow reads handoffData.attributes — everything the Flex task
+    // needs goes here. `reason` and `conversationId` are always included; the
+    // caller may pass customer_phone/name/source for the Flex task context.
+    const attributes: Record<string, unknown> = { reason, conversationId };
+    if (q.customer_phone) attributes.customer_phone = q.customer_phone;
+    if (q.customer_name) attributes.customer_name = q.customer_name;
+    attributes.source = q.source ?? 'langflow-handoff';
+
+    // Mirror the native tool: mark INACTIVE + clear status callbacks so no
+    // further webhook events race the handoff. Best-effort — non-fatal.
+    try {
+      const coClient = tac.getConversationClient();
+      if (coClient) {
+        await coClient.updateConversation(conversationId as ConversationId, 'INACTIVE');
+        await coClient.clearStatusCallbacks(conversationId as ConversationId);
+      }
+    } catch (err) {
+      console.warn(`[Handoff] INACTIVE/clearStatusCallbacks failed for ${conversationId}:`, err);
+    }
+
+    // Channel-aware, all driven by TAC's own config so the Langflow caller
+    // stays agnostic (it only knows TAC_BASE_URL). VOICE needs the live
+    // session — the redirect is driven by session.pendingHandoffData (the
+    // SDK's sanctioned direct-set), emitted as the WS `end` message by the
+    // voice turn's tail. "Is this voice?" is answered by whether a live voice
+    // session exists — no messaging-session lookup needed.
+    const voiceSession = voiceChannel.getConversationSession(conversationId as ConversationId);
+    if (voiceSession) {
+      const payload = {
+        conversationId,
+        storeId: memoryStoreId,
+        profileId: voiceSession.profileId ?? '',
+        attributes,
+      };
+      voiceSession.pendingHandoffData = { type: 'end', handoffData: JSON.stringify(payload) };
+      console.log(`[Handoff] voice handoff armed for ${conversationId} (reason="${reason}")`);
+      return reply.status(200).send({ status: 'armed', channel: 'voice' });
+    }
+
+    // MESSAGING (no live voice session): a plain Studio REST execution →
+    // Send-to-Flex. No session needed — just TAC's env flow SID + creds and
+    // the customer's messaging address (from the caller).
+    const flowSid = tcfg.studioHandoffFlowSid;
+    if (!flowSid) {
+      return reply.status(500).send({ error: 'studioHandoffFlowSid not configured' });
+    }
+    // Resolve the real messaging address, sender, and Memora profileId from CO
+    // participants rather than the bare query string. CO stores channel-prefixed
+    // addresses (e.g. "whatsapp:+55...") and hangs the Memora profileId on the
+    // CUSTOMER participant. The Langflow caller only knows the raw phone (no
+    // channel prefix) and never has the profileId — so trusting the query params
+    // sends an unprefixed To/From (wrong channel) AND an empty profileId (the
+    // Flow's get_profile widget then GETs /Profiles/ → 404). One lookup fixes both.
+    let to = q.customer_phone ?? '';
+    let from = tcfg.phoneNumber;
+    let profileId = '';
+    try {
+      const coClient = tac.getConversationClient();
+      if (coClient) {
+        const participants = await coClient.listParticipants(conversationId as ConversationId);
+        const customer = participants.find((p) => p.type === 'CUSTOMER');
+        const custAddr = customer?.addresses?.[0];
+        if (custAddr?.address) to = custAddr.address;
+        if (customer?.profileId) profileId = customer.profileId;
+        // From = the agent participant's address on the SAME channel as the customer.
+        const agent = participants.find(
+          (p) => p.type === 'AI_AGENT' || p.type === 'AGENT' || p.type === 'HUMAN_AGENT',
+        );
+        const agentAddr =
+          agent?.addresses?.find((a) => a.channel === custAddr?.channel) ?? agent?.addresses?.[0];
+        if (agentAddr?.address) from = agentAddr.address;
+        // If the caller omitted customer_phone, derive the raw E.164 (strip the
+        // channel prefix like "whatsapp:") so the Flex task still gets a usable one.
+        if (!attributes.customer_phone && custAddr?.address) {
+          attributes.customer_phone = custAddr.address.replace(/^\w+:/, '');
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `[Handoff] participant lookup failed for ${conversationId}; falling back to query params:`,
+        err,
+      );
+    }
+    if (!to) {
+      return reply
+        .status(400)
+        .send({ error: 'customer address unresolved (no participant address and no customer_phone)' });
+    }
+    const payload = { conversationId, storeId: memoryStoreId, profileId, attributes };
+    const form = new URLSearchParams();
+    form.append('To', to);
+    form.append('From', from);
+    form.append('Parameters', JSON.stringify({ HandoffData: payload }));
+    const auth = 'Basic ' + Buffer.from(`${tcfg.apiKey}:${tcfg.apiSecret}`).toString('base64');
+    try {
+      const resp = await fetch(`https://studio.twilio.com/v2/Flows/${flowSid}/Executions`, {
+        method: 'POST',
+        headers: { Authorization: auth, 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: form.toString(),
+      });
+      if (!resp.ok) {
+        const detail = await resp.text();
+        console.error(`[Handoff] messaging Studio execution failed (${resp.status}): ${detail}`);
+        return reply.status(502).send({ error: 'studio execution failed', detail });
+      }
+    } catch (err) {
+      console.error(`[Handoff] messaging Studio execution error for ${conversationId}:`, err);
+      return reply.status(502).send({ error: 'studio execution error' });
+    }
+    console.log(`[Handoff] messaging handoff executed for ${conversationId} (reason="${reason}")`);
+    return reply.status(200).send({ status: 'executed', channel: 'messaging' });
   });
 
   // Diagnostic hook: log every inbound /webhook POST with its idempotency

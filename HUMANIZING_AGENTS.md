@@ -258,8 +258,7 @@ on every turn, plus a dynamic `Current communication channel: <channel>`
 message injected before each LLM call. The channel value is the same one
 TAC passes to `onMessageReady` (`voice` / `whatsapp` / `sms` / `chat`).
 
-See [demos/grupo-sc/src/prompts/systemPrompt.md](../../demos/grupo-sc/src/prompts/systemPrompt.md)
-for the canonical pattern. The prompt instructs:
+The canonical pattern in the sample prompts instructs:
 
 - **`voice`** — no markdown, no asterisks, no emojis. Spell out long
   numbers. Short conversational sentences.
@@ -400,8 +399,7 @@ analysis of something the customer sent, not as their own words). Without
 the prefix, the agent might think the customer literally wrote "Paracetamol
 500mg, embalagem violada" — which changes the appropriate response.
 
-See [demos/grupo-sc/src/prompts/systemPrompt.md](../../demos/grupo-sc/src/prompts/systemPrompt.md)
-"Conteúdo Multimídia do Cliente" for the canonical prompt section.
+See the "Conteúdo Multimídia do Cliente" section of the canonical prompt for the reference wording.
 
 ### Cost
 
@@ -558,9 +556,7 @@ If you're not using this template directly, the porting order is:
 1. **Word-boundary streaming** — drop in
    [src/providers/streamBuffer.ts](src/providers/streamBuffer.ts) verbatim
    and wrap your voice stream. Provider-agnostic.
-2. **Channel-aware prompt** — copy the structure from
-   [demos/grupo-sc/src/prompts/systemPrompt.md](../../demos/grupo-sc/src/prompts/systemPrompt.md)
-   and adapt to your domain.
+2. **Channel-aware prompt** — copy the structure from the canonical sample prompt (voice-first channel awareness + multimedia handling sections) and adapt to your domain.
 3. **Message debounce + in-flight serialization** — pattern from
    [src/app.ts](src/app.ts) translates directly. Per-conversation state
    keyed by `conversationId`.

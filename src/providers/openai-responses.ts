@@ -16,8 +16,13 @@ export class OpenAIResponsesProvider implements LLMProvider {
   private currentTools: TACTool[] = [];
 
   constructor() {
-    console.log('[Responses] Initializing provider');
-    this.openai = new OpenAI({ apiKey: config.openai.apiKey });
+    console.log(
+      `[Responses] Initializing provider${config.openai.baseURL ? ` (baseURL=${config.openai.baseURL})` : ''}`,
+    );
+    this.openai = new OpenAI({
+      apiKey: config.openai.apiKey,
+      ...(config.openai.baseURL && { baseURL: config.openai.baseURL }),
+    });
     this.conversationHistory = [
       { type: 'message', role: 'assistant', content: config.welcomeGreeting },
     ];

@@ -72,3 +72,64 @@ export async function* bufferAtWordBoundaries(
   const tail = drain(state);
   if (tail) yield tail;
 }
+
+/**
+ * Clause-boundary buffer — the preferred variant for voice.
+ *
+ * Word-boundary buffering removes mid-word artifacts but still feeds the TTS a
+ * word at a time, so voice smoothness stays sensitive to how the *model*
+ * streams: a burstier model (often a smaller/faster one) or one with choppier
+ * punctuation turns into per-word stutter even though it never touches TTS.
+ * Flushing at clause/sentence punctuation ( . , ; : ! ? … or newline ) hands
+ * the TTS whole speakable clauses, which absorbs per-model cadence differences.
+ *
+ * Safety valve: if a clause runs long with no punctuation, fall back to a word
+ * boundary once the buffer passes `maxChars`, so a comma-less run never stalls
+ * the stream.
+ *
+ * Latency cost vs. word buffering: up to one clause (usually sub-second).
+ * Quality benefit: no mid-clause seams; robust across models. See gotcha 10.4.
+ */
+const CLAUSE_BOUNDARY = /[.,;:!?…\n]/;
+
+export function flushAtClauseBoundary(
+  state: BoundaryBufferState,
+  chunk: string,
+  maxChars = 80,
+): string {
+  state.buffer += chunk;
+  // Latest clause-ending punctuation.
+  let last = -1;
+  for (let i = state.buffer.length - 1; i >= 0; i--) {
+    if (CLAUSE_BOUNDARY.test(state.buffer[i])) {
+      last = i;
+      break;
+    }
+  }
+  if (last >= 0) {
+    // Consume a trailing space too, so the next clause starts clean.
+    let end = last + 1;
+    if (state.buffer[end] === ' ') end++;
+    const ready = state.buffer.slice(0, end);
+    state.buffer = state.buffer.slice(end);
+    return ready;
+  }
+  // No punctuation yet — only flush (at a word boundary) once we've buffered a
+  // lot, so a long comma-less clause doesn't stall pickup.
+  if (state.buffer.length >= maxChars) {
+    return flushAtWordBoundary(state, '');
+  }
+  return '';
+}
+
+export async function* bufferAtClauseBoundaries(
+  source: AsyncIterable<string>,
+): AsyncIterable<string> {
+  const state: BoundaryBufferState = { buffer: '' };
+  for await (const chunk of source) {
+    const ready = flushAtClauseBoundary(state, chunk);
+    if (ready) yield ready;
+  }
+  const tail = drain(state);
+  if (tail) yield tail;
+}

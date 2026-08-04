@@ -50,6 +50,26 @@ export const config = {
   },
   openai: {
     apiKey: process.env.OPENAI_API_KEY,
+    // Optional base URL override — points the OpenAI SDK at an
+    // OpenAI-compatible gateway (LiteLLM, Azure OpenAI, Vertex OpenAI-
+    // compat endpoints, on-prem vLLM, etc.) instead of api.openai.com.
+    //
+    //   OPENAI_BASE_URL=https://litellm.example.com/v1
+    //
+    // Undefined = default to api.openai.com. Applies to all OpenAI SDK
+    // uses in this app: chat completions, responses, whisper, vision.
+    //
+    // Testing pattern (LiteLLM proxy):
+    //   docker run -e OPENAI_API_KEY=<real-key> -p 4000:4000 \
+    //     ghcr.io/berriai/litellm-database:main-latest \
+    //     --model gpt-4o-mini
+    //   → then set OPENAI_BASE_URL=http://localhost:4000/v1 in .env
+    //     and OPENAI_API_KEY=sk-litellm-master-<whatever LiteLLM asks>.
+    baseURL: process.env.OPENAI_BASE_URL,
+    // Log the `model` field from every completion response — useful when
+    // running behind LiteLLM to detect silent model routing drift. On by
+    // default; set OPENAI_LOG_MODEL=false to silence.
+    logResponseModel: process.env.OPENAI_LOG_MODEL !== 'false',
     maxCompletionTokens: process.env.OPENAI_MAX_COMPLETION_TOKENS
       ? parseInt(process.env.OPENAI_MAX_COMPLETION_TOKENS, 10)
       : undefined,

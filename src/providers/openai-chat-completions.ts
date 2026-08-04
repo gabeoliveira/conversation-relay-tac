@@ -13,8 +13,13 @@ export class OpenAIChatCompletionsProvider implements LLMProvider {
   private currentTools: TACTool[] = [];
 
   constructor() {
-    console.log('[ChatCompletions] Initializing provider');
-    this.openai = new OpenAI({ apiKey: config.openai.apiKey });
+    console.log(
+      `[ChatCompletions] Initializing provider${config.openai.baseURL ? ` (baseURL=${config.openai.baseURL})` : ''}`,
+    );
+    this.openai = new OpenAI({
+      apiKey: config.openai.apiKey,
+      ...(config.openai.baseURL && { baseURL: config.openai.baseURL }),
+    });
     this.messages = [
       { role: 'assistant', content: config.welcomeGreeting },
     ];
@@ -70,6 +75,15 @@ export class OpenAIChatCompletionsProvider implements LLMProvider {
         }),
       });
 
+      if (config.openai.logResponseModel && completion.model) {
+        // Actual model that served this request. When behind LiteLLM, this
+        // reflects the underlying provider's model — useful for spotting
+        // silent routing drift (e.g. gpt-4o → gemini-1.5-flash-latest).
+        console.log(
+          `[ChatCompletions] response model=${completion.model} (requested=${config.llm.model})`,
+        );
+      }
+
       const message = completion.choices[0]?.message;
       if (!message) throw new Error('No message received');
 
@@ -117,9 +131,17 @@ export class OpenAIChatCompletionsProvider implements LLMProvider {
 
       let fullResponse = '';
       const toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
+      let modelLogged = false;
 
       for await (const chunk of stream) {
         if (signal?.aborted) return;
+
+        if (config.openai.logResponseModel && !modelLogged && chunk.model) {
+          console.log(
+            `[ChatCompletions] response model=${chunk.model} (requested=${config.llm.model})`,
+          );
+          modelLogged = true;
+        }
 
         const delta = chunk.choices[0]?.delta;
         const finishReason = chunk.choices[0]?.finish_reason;

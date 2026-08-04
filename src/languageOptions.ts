@@ -14,7 +14,7 @@ export const languageOptions: { [key: string]: LanguageOption } = {
     locale_code: "pt-BR",
     ttsProvider: "ElevenLabs",
     ttsLanguage: "pt-BR",
-    voice: "33B4UnXyTNbgLmdEDh5P",
+    voice: "r2fkFV8WAqXq2AqBpgJT",
     transcriptionProvider: "Deepgram",
     transcriptionLanguage: "pt-BR",
     speechModel: "nova-3-general",

@@ -332,7 +332,7 @@ Make sure your prompt has the identity section from Chapter 2:
 
 Test: send "oi" from a phone whose profile already has a name in Memora. The agent should greet you by first name.
 
-If your profile is empty (new phone), the agent won't have a name to use. That's expected — you'd handle this case with a "register name" tool (see the inter-cx-event reference build for an example).
+If your profile is empty (new phone), the agent won't have a name to use. That's expected — you'd handle this case with a "register name" tool that writes the customer's name to Memora traits on first mention.
 
 ### Write observations (custom tool)
 
@@ -681,7 +681,7 @@ Each kit gives you a scenario, a KB content checklist, a prompt skeleton, a tool
 - Branch/ATM locator info
 - Common process explanations (KYC, password reset)
 
-**Prompt skeleton**: see [the inter-cx-event prompt](../../demos/inter-cx-event/src/prompts/systemPrompt.md) as a reference — adapt the persona, scope, and tools to your scenario.
+**Prompt skeleton**: use a sample reference prompt as a starting point and adapt the persona, scope, and tools to your scenario.
 
 **Tools needed**:
 - `search_acme_kb` — Twilio Knowledge search
@@ -720,7 +720,7 @@ Each kit gives you a scenario, a KB content checklist, a prompt skeleton, a tool
 
 **Scenario**: Empathetic, compliance-aware. Answers payment-process questions from a KB. Hands off when the conversation needs personalized contract data or negotiation.
 
-See [demos/creditas-vibeathon/src/prompts/systemPrompt.md](../../demos/creditas-vibeathon/src/prompts/systemPrompt.md) for a complete, vetted prompt for this use case (CDC + LGPD compliant).
+For debt-negotiation use cases, ensure the prompt aligns with CDC (Consumer Defense Code) and LGPD (Brazilian data protection) compliance requirements — no threatening language, no shame-based tactics, no disclosure of debt to third parties, redact sensitive PII in transcripts.
 
 **KB content checklist**:
 - Payment methods (boleto, Pix, débito automático)

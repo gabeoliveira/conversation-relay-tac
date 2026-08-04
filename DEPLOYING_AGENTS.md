@@ -151,15 +151,16 @@ createApp({
   //
   // Per-conversation tool factory — runs once when the LLM provider is
   // created. Use for tools that need a runtime dependency like the TAC
-  // KnowledgeClient. The porto demo uses this to conditionally add
-  // `search_porto_faz_kb` only when KB_PORTO_FAZ_ID is set.
+  // KnowledgeClient. Common pattern: conditionally add a
+  // `search_<brand>_kb` tool only when the KB env var is set.
   // buildDynamicTools: (tac) => [...],
   //
   // Per-turn tool factory — runs on EVERY inbound message with the live
   // ConversationSession bound in. Returned tools override same-named static
   // tools for that turn only. Use for runtime guards that need to see the
   // current channel (e.g., refuse to send a WhatsApp CTA when channel is
-  // `voice`). The porto demo uses this to wrap `send_after_hours_call_cta`.
+  // `voice`). Common pattern: wrap `send_after_hours_call_cta` to no-op
+  // when already on voice.
   // buildSessionTools: (tac, session) => [...],
 });
 ```

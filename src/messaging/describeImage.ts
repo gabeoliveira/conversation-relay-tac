@@ -20,7 +20,10 @@ function getClient(): OpenAI | null {
   if (openai) return openai;
   const apiKey = config.openai.apiKey;
   if (!apiKey) return null;
-  openai = new OpenAI({ apiKey });
+  openai = new OpenAI({
+    apiKey,
+    ...(config.openai.baseURL && { baseURL: config.openai.baseURL }),
+  });
   return openai;
 }
 

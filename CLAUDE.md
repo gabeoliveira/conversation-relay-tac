@@ -115,9 +115,11 @@ Four providers are wired in this template:
 
 For demos where the customer wants visual control over agent logic, default to Langflow. For tight engineering integration with OOTB tools, default to `openai-chat-completions`.
 
+**Behind an OpenAI-compatible gateway (LiteLLM / Azure / vLLM / etc.)?** Set `OPENAI_BASE_URL=<gateway>/v1` in `.env`. The four OpenAI-provider paths (chat-completions, responses, whisper, vision) all pass this to the SDK. `LLM_PROVIDER` stays `openai-chat-completions` — LiteLLM speaks OpenAI, so no new provider is needed. The chat-completions provider logs the underlying `response.model` on every completion so you can spot silent routing drift. Full testing playbook in `LITE_LLM_GUIDE.md` (Docker-hosted local proxy + real-endpoint verification). Behavior parity between direct-OpenAI and via-LiteLLM is NOT automatic — different models behind the same gateway have different tool-selection reliability, groundedness, and streaming characteristics; pin the model during POCs and check the `response model=` log for drift.
+
 ### 2.4 Human handoff: Studio Flow → Flex
 
-The OOTB `createStudioHandoffTool` (Maestro mode) wires this automatically for `openai-*` providers. For Langflow, build a Custom Component that POSTs to Studio Executions.
+The OOTB `createStudioHandoffTool` (Maestro mode) wires this automatically for `openai-*` providers. **For Langflow, use the generic `langflow-components/tac_handoff_bridge.py`** — it just calls the app's `GET /internal/handoff` route. TAC does the channel-aware dispatch using its own env config (`TWILIO_STUDIO_HANDOFF_FLOW_SID` + creds): voice → sets `pendingHandoffData` (live-call redirect with data); messaging → a Studio Executions call. The component holds no Twilio config, so Langflow stays agnostic. (Don't POST Studio Executions from a component for voice — a REST execution can't redirect the live call.)
 
 The Studio Flow needs:
 - Trigger: `incomingRequest` (REST) for messaging, `incomingCall` for voice
